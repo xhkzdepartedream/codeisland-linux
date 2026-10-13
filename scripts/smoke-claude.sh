@@ -29,6 +29,7 @@ DAEMON="$REPO_ROOT/target/release/codeisland-daemon"
 SCRATCH="${CODEISLAND_SMOKE_DIR:-/tmp/codeisland-smoke}"
 WORKDIR="$SCRATCH/project"
 SOCKET="$SCRATCH/codeisland.sock"
+VIEW_SOCKET="$SCRATCH/codeisland-view.sock"
 JOURNAL="$SCRATCH/events.jsonl"
 PROMPT="Run the shell command: echo ok    Then reply with only the word: done"
 
@@ -69,6 +70,7 @@ PY
 ok "wrote project-scoped hooks: $WORKDIR/.claude/settings.json"
 
 export CODEISLAND_SOCKET_PATH="$SOCKET"
+export CODEISLAND_VIEW_SOCKET="$VIEW_SOCKET"
 export CODEISLAND_JOURNAL="$JOURNAL"
 export CODEISLAND_DEBUG=1
 export CODEISLAND_BRIDGE_LOG="$SCRATCH/bridge.log"
@@ -78,7 +80,7 @@ cd "$WORKDIR" || fail "cannot cd $WORKDIR"
 # --- case 1: daemon running, real claude ---------------------------------------
 "$DAEMON" >"$SCRATCH/daemon.log" 2>&1 &
 DAEMON_PID=$!
-for _ in $(seq 1 50); do [ -S "$SOCKET" ] && break; sleep 0.1; done
+for _ in $(seq 1 50); do [ -S "$SOCKET" ] && [ -S "$VIEW_SOCKET" ] && break; sleep 0.1; done
 [ -S "$SOCKET" ] || fail "daemon never created $SOCKET"
 
 hr "case 1: real claude WITH daemon (model=$MODEL)"
@@ -132,7 +134,7 @@ ok "claude unaffected by a missing socket"
 hr "case 4: PermissionRequest latency, daemon up but no UI"
 "$DAEMON" >"$SCRATCH/daemon-4.log" 2>&1 &
 DAEMON_PID4=$!
-for _ in $(seq 1 50); do [ -S "$SOCKET" ] && break; sleep 0.1; done
+for _ in $(seq 1 50); do [ -S "$SOCKET" ] && [ -S "$VIEW_SOCKET" ] && break; sleep 0.1; done
 LAT=$(python3 - "$BRIDGE" <<'PY'
 import subprocess, time, json, os, sys
 payload = json.dumps({

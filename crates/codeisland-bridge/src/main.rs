@@ -131,9 +131,19 @@ fn run() -> u8 {
         event: event_name,
         normalized_event: normalized,
         session_id: Some(session_id),
-        cwd: std::env::current_dir()
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned()),
+        // The payload's cwd is the agent's project directory and is what the
+        // island labels the card with. This process's own working directory is
+        // only a fallback: a hook can be spawned from anywhere, and using it
+        // preferentially mislabels every session.
+        cwd: stdin_payload
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().into_owned())
+            }),
         tool_name: Some(tool_name.clone()).filter(|s| !s.is_empty()),
         tool_input: stdin_payload.get("tool_input").cloned(),
         question,
@@ -186,23 +196,93 @@ fn run() -> u8 {
     EXIT_OK
 }
 
-/// Read all of stdin, bounded so a runaway producer cannot exhaust memory.
-fn read_stdin() -> Option<serde_json::Value> {
-    // The daemon's receive path caps payloads at 10 MiB upstream; the bridge
-    // only ever sees one hook payload, so a much smaller cap is plenty and
-    // prevents an obviously broken caller from costing us.
-    const MAX_INPUT: u64 = 8 * 1024 * 1024;
+/// How long to wait for the CLI to hand over its payload and close the pipe.
+///
+/// A hook producer that forgets to close stdin would otherwise block this
+/// process forever, and this process sits in the agent's critical path. Upstream
+/// solves the same problem with alarm(5); polling with a deadline does it without
+/// relying on a process-wide signal.
+///
+/// Shortened via CODEISLAND_STDIN_TIMEOUT_MS so the deadline itself is testable
+/// without a 5 second suite.
+fn stdin_deadline() -> Duration {
+    std::env::var("CODEISLAND_STDIN_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(5))
+}
 
-    let mut raw = Vec::new();
-    std::io::stdin()
-        .take(MAX_INPUT)
-        .read_to_end(&mut raw)
-        .ok()?;
+/// Cap on the payload. The daemon accepts up to 10 MiB (large Codex diffs); the
+/// bridge only sees one hook payload, so a smaller ceiling is plenty and stops an
+/// obviously broken producer from costing memory.
+const MAX_INPUT: usize = 8 * 1024 * 1024;
+
+/// Read all of stdin, bounded by both a deadline and a size ceiling.
+///
+/// Returns None on timeout, on empty input, and on unparsable JSON -- every one
+/// of those takes the same silent-exit path, so there is nothing to distinguish
+/// for the caller.
+fn read_stdin() -> Option<serde_json::Value> {
+    use std::os::fd::AsRawFd;
+
+    let fd = std::io::stdin().as_raw_fd();
+    let deadline = std::time::Instant::now() + stdin_deadline();
+    let mut raw: Vec<u8> = Vec::with_capacity(4096);
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            debug_log("stdin deadline reached, giving up on this event");
+            return None;
+        }
+        if raw.len() >= MAX_INPUT {
+            debug_log("stdin exceeded size ceiling, dropping payload");
+            return None;
+        }
+
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+        // SAFETY: pfd is a valid local, nfds is 1, and poll() only writes to it.
+        let ready = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        if ready == 0 {
+            debug_log("stdin deadline reached, giving up on this event");
+            return None;
+        }
+
+        let mut stdin = std::io::stdin();
+        match stdin.read(&mut buf) {
+            Ok(0) => break, // EOF: the CLI closed the pipe, payload is complete.
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() >= MAX_INPUT {
+                    debug_log("stdin exceeded size ceiling, dropping payload");
+                    return None;
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
+
     if raw.is_empty() {
         return None;
     }
     serde_json::from_slice(&raw).ok()
 }
+
 
 fn connect(path: &std::path::Path) -> Option<UnixStream> {
     // UnixStream::connect has no timeout knob; a non-blocking connect polled

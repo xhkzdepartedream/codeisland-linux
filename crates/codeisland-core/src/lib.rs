@@ -6,7 +6,9 @@
 
 pub mod event;
 pub mod protocol;
+pub mod session;
 pub mod socket_path;
 
 pub use event::{EventNormalizer, RouteKind};
+pub use session::{Session, SessionRegistry, SessionStatus, ViewUpdate};
 pub use socket_path::socket_path;

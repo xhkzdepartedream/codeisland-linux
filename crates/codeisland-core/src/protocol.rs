@@ -115,6 +115,24 @@ impl HookEvent {
             .unwrap_or("");
         crate::event::EventNormalizer::route_kind(name, self.question.is_some())
     }
+
+    /// The one line the island card shows for this event.
+    ///
+    /// Preference order is what a human scanning cards needs: a question the
+    /// agent asked outranks everything, then the tool summary, then any message
+    /// the CLI attached.
+    pub fn detail_line(&self) -> Option<String> {
+        if let Some(question) = self.question.as_deref().filter(|s| !s.trim().is_empty()) {
+            return Some(question.to_string());
+        }
+        if let Some(summary) = self.summary.as_deref().filter(|s| !s.trim().is_empty()) {
+            return Some(summary.to_string());
+        }
+        self.extra
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    }
 }
 
 /// Sanitised description of what a tool call is about to do, for display.
