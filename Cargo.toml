@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/codeisland-core",
+    "crates/codeisland-bridge",
+    "crates/codeisland-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["xhkzdepartedream"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+# Panic strategy stays at the default (unwind) for both binaries.
+# - The bridge turns a panic into a clean exit 0 through its panic hook, so it
+#   never leaves a non-zero status in the agent's critical path.
+# - The daemon must survive a panic in one connection thread without taking
+#   every other agent session down with it.
+# `panic = "abort"` is also not accepted inside a `[profile.release.package.*]`
+# override block.

@@ -1,0 +1,17 @@
+/target
+
+# Build artefacts of the QML shell (phase 1+).
+/shell/build
+
+# Local runtime state, never committed.
+*.log
+events.jsonl
+
+# Editor and OS noise.
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local smoke-test scratch space.
+/tmp-smoke

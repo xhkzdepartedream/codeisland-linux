@@ -1,0 +1,19 @@
+[Unit]
+Description=CodeIsland Linux daemon (AI coding agent status)
+Documentation=file://%h/apps/codeisland-linux/README.md
+# The daemon only needs the user session bus, so wait for it rather than for
+# the multi-user target.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/apps/codeisland-linux/target/release/codeisland-daemon
+Restart=on-failure
+RestartSec=2
+# The daemon holds no state that must survive a restart; the hook bridge treats
+# a missing daemon as "let the CLI decide", so a restart is always safe.
+TimeoutStopSec=5
+
+[Install]
+WantedBy=graphical-session.target

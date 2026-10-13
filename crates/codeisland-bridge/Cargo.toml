@@ -1,0 +1,16 @@
+[package]
+name = "codeisland-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "codeisland-bridge"
+path = "src/main.rs"
+
+[dependencies]
+codeisland-core = { path = "../codeisland-core" }
+serde_json.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
