@@ -31,6 +31,8 @@ QVariant SessionsModel::data(const QModelIndex &index, int role) const
         return projectLabel(row.cwd, row.source);
     case DetailRole:
         return row.detail;
+    case OriginRole:
+        return row.origin;
     case ToolCallsRole:
         return row.toolCalls;
     case LastEventMsRole:
@@ -50,6 +52,7 @@ QHash<int, QByteArray> SessionsModel::roleNames() const
         {CwdRole, "cwd"},
         {ProjectRole, "project"},
         {DetailRole, "detail"},
+        {OriginRole, "origin"},
         {ToolCallsRole, "toolCalls"},
         {LastEventMsRole, "lastEventMs"},
         {StartedMsRole, "startedMs"},
@@ -69,6 +72,12 @@ void SessionsModel::applyUpsert(const QVariantMap &session)
     row.status = session.value(QStringLiteral("status")).toString();
     row.cwd = session.value(QStringLiteral("cwd")).toString();
     row.detail = session.value(QStringLiteral("detail")).toString();
+    row.origin = session.value(QStringLiteral("origin")).toString();
+    if (row.origin.isEmpty()) {
+        // Frames written before discovery existed carry no origin; the authoritative
+        // reading is the safe default.
+        row.origin = QStringLiteral("hook");
+    }
     row.toolCalls = session.value(QStringLiteral("tool_calls")).toInt();
     row.lastEventMs = static_cast<qint64>(session.value(QStringLiteral("last_event_ms")).toDouble());
     row.startedMs = static_cast<qint64>(session.value(QStringLiteral("started_ms")).toDouble());
@@ -119,6 +128,10 @@ void SessionsModel::applySnapshot(const QVariantList &sessions)
         row.status = map.value(QStringLiteral("status")).toString();
         row.cwd = map.value(QStringLiteral("cwd")).toString();
         row.detail = map.value(QStringLiteral("detail")).toString();
+        row.origin = map.value(QStringLiteral("origin")).toString();
+        if (row.origin.isEmpty()) {
+            row.origin = QStringLiteral("hook");
+        }
         row.toolCalls = map.value(QStringLiteral("tool_calls")).toInt();
         row.lastEventMs = static_cast<qint64>(map.value(QStringLiteral("last_event_ms")).toDouble());
         row.startedMs = static_cast<qint64>(map.value(QStringLiteral("started_ms")).toDouble());

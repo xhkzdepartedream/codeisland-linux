@@ -613,6 +613,7 @@ delegate: Rectangle {
                     required property int index
                     required property string sessionId
                     required property string source
+                    required property string origin
                     required property string status
                     required property string project
                     required property string detail
@@ -682,7 +683,10 @@ delegate: Rectangle {
                             Layout.alignment: Qt.AlignVCenter
                             spacing: 2
                             Text {
-                                text: source
+                                // A discovered row is a statement about a file's mtime, not
+                                // about what an agent is waiting for -- say so on the row
+                                // rather than letting an inference look like a report.
+                                text: origin === "discovered" ? source + " ·推断" : source
                                 color: "#636366"
                                 font.pixelSize: 11
                             }

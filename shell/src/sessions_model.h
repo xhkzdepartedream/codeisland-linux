@@ -19,6 +19,10 @@ struct SessionRow {
     QString status;
     QString cwd;
     QString detail;
+    /// "hook" when the agent reported itself, "discovered" when we inferred the session from
+    /// a transcript owned by a live process. The UI must not present the two identically:
+    /// a discovered row can say active or quiet, and can never say "waiting for you".
+    QString origin = QStringLiteral("hook");
     int toolCalls = 0;
     qint64 lastEventMs = 0;
     qint64 startedMs = 0;
@@ -42,6 +46,7 @@ public:
         CwdRole,
         ProjectRole,
         DetailRole,
+        OriginRole,
         ToolCallsRole,
         LastEventMsRole,
         StartedMsRole,
