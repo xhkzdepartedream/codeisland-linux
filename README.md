@@ -91,11 +91,21 @@ pi remove  <同一个绝对路径>                # 相对路径不匹配，必�
 ```bash
 cargo build --release
 
-# 终端 A：常驻程序
+# 终端 A：常驻程序（收事件、持有审批卡）
 ./target/release/codeisland-daemon
 
-# 终端 B：模拟一个 hook 事件，观察常驻程序输出
+# 终端 B：岛本身（屏幕上那颗药丸）。没有它，卡只存在于常驻程序里，谁也看不见
+./shell/build/codeisland-shell
+#   --screen eDP-1 / --screen 0 选屏（多屏且缩放不同，岛的位置随屏而变）
+#   --list-screens 列出可用屏
+# 顺序不强制：岛会重连常驻程序，谁先起都行。
+
+# 终端 C：模拟一个 hook 事件，观察两边输出
 echo '{"hook_event_name":"SessionStart","session_id":"demo"}' \
+  | ./target/release/codeisland-bridge --source claude
+
+# 想看审批卡长什么样（会阻塞到你点按钮，或 1 小时后超时沉默）
+echo '{"hook_event_name":"PermissionRequest","session_id":"demo","cwd":"/tmp/demo","tool_name":"Bash","tool_input":{"command":"rm -rf ./build"}}' \
   | ./target/release/codeisland-bridge --source claude
 ```
 
@@ -108,6 +118,20 @@ scripts/smoke-claude.sh
 ```
 
 它把 hook 写进**一次性的项目级** `.claude/settings.json`，不动你的全局 `~/.claude/settings.json`。
+
+### 开机常驻
+
+`packaging/systemd/user/codeisland-daemon.service` 只管**常驻程序**（它无状态，重启永远安全）：
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp packaging/systemd/user/codeisland-daemon.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now codeisland-daemon
+```
+
+岛本体是 layer-shell 表面，属于图形会话，不走这个 unit —— 想开机可见就放一份
+`~/.config/autostart/codeisland-shell.desktop`（`Exec=` 指向 `shell/build/codeisland-shell`）。
+这一条目前只是约定俗成的做法，**本仓库还没有为它提供打包文件**，别以为装完 unit 就全自动了。
 
 ## 安全契约
 
