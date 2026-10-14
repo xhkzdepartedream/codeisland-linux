@@ -14,7 +14,7 @@
 | 3 | 回答问题、跳转终端、桌面通知、hook 自动安装 | 进行中：**hook 自动安装 + 复查完成**（2026-10-13，`codeisland-hookctl`）；**提问卡完成**（2026-10-14，单选问题；契约见 `docs/协议.md`） |
 | 4 | 多 CLI 铺开、SSH 远程、推送渠道 | **codex、pi 已接入**（pi 走扩展适配器 `integrations/pi/codeisland.ts`，三例实测：批准生成文件、驳回不生成且无 `PostToolUse`、岛不在场时由 pi 自己决定）；进行中：**codex 已可安装**（2026-10-14：`codeisland-hookctl --source codex` 写项目级 `.codex/hooks.json`，审批闭环实测通过，信任可一次授予并持久化；codex 另有文件夹信任这道前置门，见 `docs/协议.md`） |
 
-阶段 4 的 codex、pi 已接入，但两者都只在 **hook 装好之后**启动的 agent 才说话。所以另加了**发现层**（2026-10-14，`crates/codeisland-daemon/src/discover.rs`）：走 `/proc` 找到活着的 claude/codex/pi 进程，配上它拥有的存档文件，于是 hook 装之前就开着的会话、包括**当前正在说话的这个会话**，都能看见。配对靠三档证据：进程开着的会话文件（最硬，codex 的 writer-lock 与 rollout）→ 进程所在目录 → 存档新鲜度。它只能推断 `working`/`idle`——没有 socket 就证明不了「卡在等人回答」——所以界面把这类行标成 `源 ·推断`。边界见 `docs/协议.md`。
+阶段 4 的 codex、pi 已接入，但两者都只在 **hook 装好之后**启动的 agent 才说话。所以另加了**发现层**（2026-10-14，`crates/codeisland-daemon/src/discover.rs`）：走 `/proc` 找到活着的 claude/codex/pi 进程，配上它拥有的存档文件，于是 hook 装之前就开着的会话、包括**当前正在说话的这个会话**，都能看见。配对靠三档证据：进程开着的会话文件（最硬，codex 的 writer-lock 与 rollout）→ 进程所在目录 → 存档新鲜度。它只能推断 `working`/`idle`——没有 socket 就证明不了「卡在等人回答」——所以界面把这类行标成 `源 ·推断`。**子代理**（codex 的 Guardian review、pi 的嵌套 run）折进被它服务的父会话，不当并列的第二个会话。行上的副行是该会话**最后一个工具调用**（`exec_command · ssh main '…'`），所以能看出它在干什么。边界见 `docs/协议.md`。
 
 阶段 0 没有界面，所以常驻程序**故意不回答**权限请求——它保持沉默，让 agent 回落到自己的权限提示。见下面「安全契约」。
 
