@@ -18,6 +18,28 @@ use serde::{Deserialize, Serialize};
 use crate::event::RouteKind;
 use crate::protocol::HookEvent;
 
+/// How the island learned about a session, and the difference is a claim about truth.
+///
+/// `Hook` means the agent told us, live: its status can say "waiting for you" because a
+/// request is genuinely parked on a socket. `Discovered` means we inferred the session from a
+/// transcript file that a live process owns: we may say "writing" or "quiet", and we may not
+/// say anything about what it is waiting for, because no socket proves that. The UI reads this
+/// to keep the two apart instead of letting an inferred row look like a real one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// Established by a hook event.
+    #[default]
+    Hook,
+    /// Inferred from a live process and its transcript.
+    Discovered,
+}
+
+/// How long a discovered row survives after discovery stops seeing it.
+/// Grace because one skipped scan (a slow directory walk) must not make a live session
+/// blink out of the island.
+pub const DISCOVERED_GRACE_MS: u64 = 30_000;
+
 /// What an agent session is doing, as the island must present it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,6 +89,10 @@ pub struct Session {
     /// Latest human-readable activity line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// How this session became known. Defaults to Hook so frames written before discovery
+    /// existed, and any CLI that omits it, keep behaving as the authoritative case.
+    #[serde(default)]
+    pub origin: Origin,
     /// Unix epoch milliseconds of the last event that moved this session.
     pub last_event_ms: u64,
     /// Unix epoch milliseconds when this session appeared.
@@ -222,7 +248,12 @@ impl SessionRegistry {
 
         let existed = self.sessions.contains_key(&id);
         let mut session = if existed {
-            self.sessions.get(&id).cloned().expect("just checked")
+            let mut prior = self.sessions.get(&id).cloned().expect("just checked");
+            // A hook event speaks for this session now. An inferred row becomes an
+            // authoritative one, which is what lets it start saying "waiting for you" --
+            // something discovery may never claim.
+            prior.origin = Origin::Hook;
+            prior
         } else {
             Session {
                 id: id.clone(),
@@ -231,6 +262,7 @@ impl SessionRegistry {
                 cwd: None,
                 branch: None,
                 detail: None,
+                origin: Origin::Hook,
                 last_event_ms: now_ms,
                 started_ms: now_ms,
                 tool_calls: 0,
@@ -309,6 +341,74 @@ impl SessionRegistry {
     /// Returns the update to broadcast, or `None` when there was nothing to
     /// release. Callers must check that no *other* request from the same session
     /// is still parked before calling -- two cards can be up at once.
+    /// Take note of a session that a live process owns but that never fired a hook.
+    ///
+    /// Returns an update only when something the UI should see actually changed, and never
+    /// touches a session a hook already claimed: a discovered row is an inference, so the
+    /// moment the real event arrives the real event wins.
+    pub fn register_discovered(
+        &mut self,
+        id: &str,
+        source: &str,
+        cwd: &str,
+        detail: Option<String>,
+        status: SessionStatus,
+        now_ms: u64,
+    ) -> Option<ViewUpdate> {
+        if let Some(existing) = self.sessions.get_mut(id) {
+            if existing.origin != Origin::Discovered {
+                return None; // hooks know better than we do
+            }
+            let changed = existing.status != status || existing.detail != detail;
+            existing.status = status;
+            existing.detail = detail.or_else(|| existing.detail.clone());
+            existing.last_event_ms = now_ms;
+            return changed.then(|| ViewUpdate::SessionUpsert {
+                session: existing.clone(),
+            });
+        }
+        let session = Session {
+            id: id.to_string(),
+            source: source.to_string(),
+            status,
+            cwd: Some(cwd.to_string()),
+            branch: None,
+            detail,
+            origin: Origin::Discovered,
+            last_event_ms: now_ms,
+            started_ms: now_ms,
+            tool_calls: 0,
+        };
+        self.sessions.insert(id.to_string(), session.clone());
+        // `ordered()` walks `order`, not the map -- inserting only the map leaves a session
+        // that exists, is updated, and is never displayed. That is exactly the bug this line
+        // replaced: discovery paired a session on every scan and the island stayed empty.
+        if !self.order.iter().any(|existing| existing == id) {
+            self.order.push(id.to_string());
+        }
+        Some(ViewUpdate::SessionUpsert { session })
+    }
+
+    /// Drop discovered rows whose process is gone. Called with the set of ids discovery still
+    /// sees; anything discovered earlier and missing now is no longer running.
+    pub fn forget_discovered_not_in(&mut self, alive: &[String], now_ms: u64) -> Vec<ViewUpdate> {
+        let stale: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.origin == Origin::Discovered)
+            .filter(|(id, session)| !alive.contains(id) && session.last_event_ms + DISCOVERED_GRACE_MS < now_ms)
+            .map(|(id, _)| id.clone())
+            .collect();
+        stale
+            .into_iter()
+            .map(|id| {
+                self.sessions.remove(&id);
+                self.order.retain(|existing| existing != &id);
+                ViewUpdate::SessionRemove { id }
+            })
+            .collect()
+    }
+
     pub fn release_request(&mut self, session_id: &str) -> Option<ViewUpdate> {
         let session = self.sessions.get_mut(session_id)?;
         // Both "waiting" states mean the island was asked to act: a permission gate
@@ -662,4 +762,56 @@ mod permission_wire_tests {
         assert!(text.contains("permission_resolved"), "{text}");
         assert!(!text.contains("behavior"), "{text}");
     }
+
+    #[test]
+    fn a_discovered_session_is_visible_in_the_snapshot() {
+        // The bug this guards: register_discovered inserted into the map but not into the
+        // ordering vector, and ordered() walks the ordering vector -- so discovery paired a
+        // session on every scan, broadcast it, and the island still showed nothing. An update
+        // nobody can see is not an update.
+        let mut reg = SessionRegistry::new();
+        let update = reg
+            .register_discovered(
+                "d1",
+                "pi",
+                "/tmp/proj",
+                Some("存档 · message".into()),
+                SessionStatus::Working,
+                1_000,
+            )
+            .expect("a new discovered session must produce an update");
+        assert!(matches!(update, ViewUpdate::SessionUpsert { .. }));
+        let snapshot = reg.snapshot();
+        let ViewUpdate::Snapshot { sessions } = snapshot else {
+            panic!("snapshot shape changed");
+        };
+        assert_eq!(sessions.len(), 1, "the discovered session must be in the snapshot");
+        assert_eq!(sessions[0].id, "d1");
+        assert_eq!(sessions[0].origin, Origin::Discovered);
+
+        // And a hook event for the same id upgrades the row rather than duplicating it.
+        let mut event = HookEvent::default();
+        event.session_id = Some("d1".into());
+        event.source = Some("pi".into());
+        event.normalized_event = Some("SessionStart".into());
+        reg.apply(&event, 2_000);
+        let ViewUpdate::Snapshot { sessions } = reg.snapshot() else {
+            panic!("snapshot shape changed");
+        };
+        assert_eq!(sessions.len(), 1, "one session, not two rows for one id");
+        assert_eq!(sessions[0].origin, Origin::Hook, "a hook speaks for the session now");
+    }
+
+    #[test]
+    fn a_forgotten_discovered_session_leaves_the_ordering_too() {
+        let mut reg = SessionRegistry::new();
+        reg.register_discovered("d2", "pi", "/tmp/p", None, SessionStatus::Idle, 1_000);
+        let gone = reg.forget_discovered_not_in(&[], 10_000_000);
+        assert_eq!(gone.len(), 1);
+        let ViewUpdate::Snapshot { sessions } = reg.snapshot() else {
+            panic!("snapshot shape changed");
+        };
+        assert!(sessions.is_empty(), "removed rows must not linger in the order");
+    }
+
 }
