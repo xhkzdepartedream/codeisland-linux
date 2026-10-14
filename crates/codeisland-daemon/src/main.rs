@@ -12,6 +12,7 @@
 //! approval. Silence is the only honest answer, and it is what happens whenever
 //! no UI is listening.
 
+mod discover;
 mod journal;
 mod jump;
 mod notify;
@@ -29,7 +30,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use codeisland_core::event::RouteKind;
 use codeisland_core::protocol::{permission_answer, Behavior, HookEvent};
 use codeisland_core::question::{self, Question};
-use codeisland_core::session::{AnswerChoice, PermissionRequestView, SessionRegistry, ViewUpdate};
+use codeisland_core::session::{AnswerChoice, PermissionRequestView, SessionRegistry, SessionStatus, ViewUpdate};
 use codeisland_core::socket_path;
 
 use journal::{default_journal_path, Journal};
@@ -84,7 +85,49 @@ impl Shared {
     }
 }
 
+/// One scan, printed, then exit: `codeisland-daemon --discover-once`.
+///
+/// Discovery is a background guess, and "why is that session missing" was otherwise
+/// answerable only by reading code and reasoning about it. This makes it a question you can
+/// ask the binary.
+fn discover_once() {
+    let now = now_ms();
+    let processes = discover::agent_processes();
+    println!("codeisland-daemon: 活着的 agent 进程 {} 个", processes.len());
+    for process in &processes {
+        println!(
+            "  {}  pid={}  cwd={}",
+            process.harness.as_str(),
+            process.pid,
+            process.cwd.display()
+        );
+    }
+    let mut cache = HashMap::new();
+    let found = discover::discover(now, DISCOVER_MAX_AGE_MS, DISCOVER_PROBE, &mut cache);
+    println!("codeisland-daemon: 配上存档的会话 {} 个", found.len());
+    for item in &found {
+        let liveness = match discover::liveness(item.last_write_ms, now, DISCOVER_ACTIVE_MS) {
+            discover::Liveness::Active => "在写",
+            discover::Liveness::Quiet => "安静",
+        };
+        println!(
+            "  {}  {}  {}  {}  {} 秒前  {}",
+            item.harness.as_str(),
+            item.session_id,
+            liveness,
+            item.cwd,
+            (now.saturating_sub(item.last_write_ms) / 1000),
+            item.transcript.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+        );
+    }
+    let _ = discover::transcript_cwd(std::path::Path::new("/dev/null"));
+}
+
 fn main() {
+    if std::env::args().any(|arg| arg == "--discover-once") {
+        discover_once();
+        return;
+    }
     let hook_path = socket_path();
     let view_path = view_socket_path();
     let journal_path = default_journal_path();
@@ -98,6 +141,7 @@ fn main() {
     };
 
     let shared = Arc::new(Shared::new(journal));
+    spawn_discovery(Arc::clone(&shared));
 
     if let Err(err) = std::fs::create_dir_all(view_path.parent().unwrap_or(Path::new("/tmp"))) {
         eprintln!("codeisland-daemon: cannot create view socket directory: {err}");
@@ -953,5 +997,102 @@ mod tests {
         assert!(outcome.is_ok(), "an empty connection must not be an error: {outcome:?}");
         assert_eq!(shared.registry.lock().unwrap().len(), 0);
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+/// How often to look for sessions that never fired a hook.
+const DISCOVER_INTERVAL: Duration = Duration::from_secs(5);
+/// A transcript whose last write is older than this belongs to a session nobody is running.
+const DISCOVER_MAX_AGE_MS: u64 = 2 * 60 * 60 * 1000;
+/// Written to inside this window means the agent is producing output right now.
+const DISCOVER_ACTIVE_MS: u64 = 20_000;
+/// Newest transcripts to consider per harness per scan.
+const DISCOVER_PROBE: usize = 12;
+
+/// Watch for already-running agent sessions and keep them in the registry.
+///
+/// Costs are bounded three ways, because the archives are not small -- the transcript of the
+/// session this code was written in is 11.9 MB -- and because a scan runs every few seconds:
+/// only the newest handful of files per harness, only inside the age window (candidates come
+/// sorted, so the first stale file ends the scan), and each file's cwd is read once and
+/// cached against its size so a transcript that is not being rewritten is never re-parsed.
+fn spawn_discovery(shared: Arc<Shared>) {
+    let started = std::thread::Builder::new()
+        .name("codeisland-discover".to_string())
+        .spawn(move || {
+            let mut cwd_cache: HashMap<std::path::PathBuf, (u64, Option<String>)> = HashMap::new();
+            loop {
+                scan_once(&shared, &mut cwd_cache);
+                std::thread::sleep(DISCOVER_INTERVAL);
+            }
+        });
+    if started.is_err() {
+        println!("codeisland-daemon: 发现线程起不来，只影响「看见已开着的会话」，不影响审批");
+    }
+}
+
+fn scan_once(
+    shared: &Arc<Shared>,
+    cwd_cache: &mut HashMap<std::path::PathBuf, (u64, Option<String>)>,
+) {
+    let now = now_ms();
+    let found = discover::discover(now, DISCOVER_MAX_AGE_MS, DISCOVER_PROBE, cwd_cache);
+    if std::env::var_os("CODEISLAND_DEBUG_DISCOVERY").is_some() {
+        // Off by default: this runs every few seconds and a daemon that chats in its own log
+        // is a daemon nobody reads. When it IS on, "0 rows" must be explainable from the line
+        // alone -- which processes were seen, and which of them paired with a transcript.
+        println!(
+            "codeisland-daemon: 发现扫描 → 配上存档 {} 个 {} | 进程 {}",
+            found.len(),
+            found
+                .iter()
+                .map(|item| format!(
+                    "{}#{}→{}",
+                    item.harness.as_str(),
+                    item.pid.unwrap_or(0),
+                    &item.session_id[..8.min(item.session_id.len())]
+                ))
+                .collect::<Vec<_>>()
+                .join(" "),
+            discover::agent_processes()
+                .iter()
+                .map(|p| format!("{}#{}@{}", p.harness.as_str(), p.pid, p.cwd.display()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    let alive: Vec<String> = found.iter().map(|item| item.session_id.clone()).collect();
+    let mut updates: Vec<ViewUpdate> = Vec::new();
+
+    let Ok(mut registry) = shared.registry.lock() else {
+        return;
+    };
+    for item in &found {
+        let status = match discover::liveness(item.last_write_ms, now, DISCOVER_ACTIVE_MS) {
+            discover::Liveness::Active => SessionStatus::Working,
+            discover::Liveness::Quiet => SessionStatus::Idle,
+        };
+        let detail = discover::tail_hint(&item.transcript).map(|hint| format!("存档 · {hint}"));
+        if let Some(update) = registry.register_discovered(
+            &item.session_id,
+            item.harness.as_str(),
+            &item.cwd,
+            detail,
+            status,
+            now,
+        ) {
+            updates.push(update);
+        }
+    }
+    updates.extend(registry.forget_discovered_not_in(&alive, now));
+    drop(registry);
+
+    if updates.is_empty() {
+        return;
+    }
+    if let Ok(mut clients) = shared.clients.lock() {
+        for update in &updates {
+            clients.broadcast(update);
+        }
     }
 }
