@@ -1068,9 +1068,22 @@ fn scan_once(
         return;
     };
     for item in &found {
-        let status = match discover::liveness(item.last_write_ms, now, DISCOVER_ACTIVE_MS) {
-            discover::Liveness::Active => SessionStatus::Working,
-            discover::Liveness::Quiet => SessionStatus::Idle,
+        // Ask the transcript what state it is in before guessing from its mtime.
+        //
+        // The file records the turn lifecycle, so for a codex/pi/claude session the answer is a
+        // statement of fact: codex writes task_started / task_complete / turn_aborted, pi writes
+        // an assistant toolCall (waiting) or text-only reply (finished), claude writes the same
+        // distinction as tool_use vs text plus tool_result rows. Reading those is what upstream
+        // does, and it is why a turn that has been running quietly for minutes no longer reads as
+        // idle. Freshness is kept only as the fallback for a transcript that states nothing --
+        // and in that case the row is honestly labelled as inferred rather than as fact.
+        let stated = codeisland_core::turn::turn_state(&item.transcript);
+        let status = match stated {
+            Some(state) => state,
+            None => match discover::liveness(item.last_write_ms, now, DISCOVER_ACTIVE_MS) {
+                discover::Liveness::Active => SessionStatus::Working,
+                discover::Liveness::Quiet => SessionStatus::Idle,
+            },
         };
         let detail = discover::tail_hint(&item.transcript).map(|hint| format!("存档 · {hint}"));
         if let Some(update) = registry.register_discovered(
@@ -1080,6 +1093,7 @@ fn scan_once(
             detail,
             status,
             item.branch.clone(),
+            stated.is_some(),
             now,
         ) {
             updates.push(update);
