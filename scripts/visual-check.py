@@ -138,11 +138,37 @@ def darkened(before, after, screen, ignore):
 
 
 def send(env, payload):
+    """Post a fire-and-forget event and wait for the daemon's acknowledgement."""
     result = subprocess.run([str(BRIDGE), "--source", payload.get("source", "claude")],
                             input=json.dumps(payload), capture_output=True,
                             text=True, env=env, timeout=20)
     if result.returncode != 0:
         die(f"bridge exited {result.returncode}: {result.stderr}")
+
+
+def send_held(env, payload):
+    """Post a *gating* event and keep the hook open, returning the process.
+
+    A permission request blocks by design until a human answers, so waiting for the
+    bridge to exit is wrong: `subprocess.run(..., timeout=20)` used to raise here,
+    and worse, the earlier version of this check "passed" only because no UI client
+    was connected -- the daemon then answered with immediate silence, the bridge
+    returned at once, and the expansion being measured was the session row, not the
+    permission card. Holding the connection open is what makes the card real.
+
+    The caller kills it; killing the hook is the agent-death path, which the daemon
+    must turn into silence and a withdrawn card.
+    """
+    proc = subprocess.Popen([str(BRIDGE), "--source", payload.get("source", "claude")],
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, env=env)
+    proc.stdin.write(json.dumps(payload).encode())
+    # Closing stdin is what ends the CLI's payload for the bridge: it reads stdin to
+    # EOF. Left open, the bridge sits waiting for more input and never reaches the
+    # daemon at all -- which is exactly how this check reported "no morph" with a
+    # connected viewer and no [permission] line in the daemon log.
+    proc.stdin.close()
+    return proc
 
 
 def cpu_ticks(pid):
@@ -167,9 +193,9 @@ def run(daemon, shell_holder, before, ignore, screen, collapsed_expected, hit):
     send(env, {"hook_event_name": "SessionStart", "session_id": "V1",
                "cwd": "/home/dev/blog", "source": "claude"})
     time.sleep(0.5)
-    send(env, {"hook_event_name": "PermissionRequest", "session_id": "V2",
-               "cwd": "/home/dev/api", "source": "claude", "tool_name": "Bash",
-               "tool_input": {"command": "rm -rf /tmp/scratch"}})
+    held = send_held(env, {"hook_event_name": "PermissionRequest", "session_id": "V2",
+                           "cwd": "/home/dev/api", "source": "claude", "tool_name": "Bash",
+                           "tool_input": {"command": "rm -rf /tmp/scratch"}})
     time.sleep(1.8)  # let the spring animation settle
     big = darkened(before, capture(), screen, ignore)
     if big is None:
@@ -181,7 +207,12 @@ def run(daemon, shell_holder, before, ignore, screen, collapsed_expected, hit):
             f"expected both >= {MORPH_MIN_GROWTH}")
     ok(f"permission request morphs the pill: "
        f"{hit['w']}x{hit['h']} -> {big['w']}x{big['h']} px")
+    if held.poll() is not None:
+        die("the hook exited on its own: the daemon answered a request nobody "
+            "approved, which would mean the island auto-decided")
 
+    held.kill()
+    held.wait(timeout=5)
     send(env, {"hook_event_name": "SessionEnd", "session_id": "V1", "source": "claude"})
     send(env, {"hook_event_name": "SessionEnd", "session_id": "V2", "source": "claude"})
     time.sleep(8.0)  # the celebration window is 6 s

@@ -1,9 +1,11 @@
 #include "daemon_client.h"
 
+#include "permission_model.h"
 #include "sessions_model.h"
 
 #include <QDebug>
 #include <QLocalSocket>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
@@ -33,9 +35,11 @@ constexpr int kRetryMs = 1500;
 
 } // namespace
 
-DaemonClient::DaemonClient(SessionsModel *model, QObject *parent)
+DaemonClient::DaemonClient(SessionsModel *model, PermissionModel *permissions,
+                           QObject *parent)
     : QObject(parent)
     , m_model(model)
+    , m_permissions(permissions)
     , m_socket(new QLocalSocket(this))
 {
     m_retry.setSingleShot(true);
@@ -54,6 +58,10 @@ DaemonClient::DaemonClient(SessionsModel *model, QObject *parent)
         m_connected = false;
         emit connectedChanged();
         m_model->clearAll();
+        // A card the human can no longer reach must disappear: the daemon has
+        // already released the parked hook, so clicking this button now would
+        // decide nothing while looking like it decided something.
+        m_permissions->clearAll();
         if (!m_stopping) {
             scheduleReconnect();
         }
@@ -100,17 +108,129 @@ void DaemonClient::stop()
     }
 }
 
+void DaemonClient::decide(const QString &requestId, const QString &behavior)
+{
+    // Every exit from here is logged. An empty requestId used to return silently,
+    // which made "the button does nothing" indistinguishable from "the click never
+    // arrived" -- exactly the debugging dead end this hit.
+    qInfo() << "codeisland-shell: decide() called" << requestId << behavior;
+
+    if (requestId.isEmpty()) {
+        qWarning() << "codeisland-shell: decide() dropped: empty request id"
+                      " (the card lost its role data)";
+        return;
+    }
+    QString normalised = behavior.toLower();
+    if (normalised != QLatin1String("allow") && normalised != QLatin1String("deny")) {
+        qWarning() << "codeisland-shell: refusing to send an unknown behaviour"
+                   << behavior;
+        return;
+    }
+
+    QJsonObject payload{
+        {QStringLiteral("type"), QStringLiteral("permission_decision")},
+        {QStringLiteral("request_id"), requestId},
+        {QStringLiteral("behavior"), normalised},
+    };
+    writeDecision(payload);
+}
+
+void DaemonClient::answer(const QString &requestId, const QVariantList &answers)
+{
+    qInfo() << "codeisland-shell: answer() called" << requestId << "entries:" << answers.size();
+
+    if (requestId.isEmpty()) {
+        qWarning() << "codeisland-shell: answer() dropped: empty request id";
+        return;
+    }
+    if (answers.isEmpty()) {
+        // Sending an empty answer set would be refused by the daemon anyway; saying
+        // nothing here keeps the log honest about which side dropped the click.
+        qWarning() << "codeisland-shell: answer() dropped: no options selected";
+        return;
+    }
+
+    // QJsonObject takes QJsonValue, not QVariant: a QVariantList here does not
+    // convert, so the pairs are assembled as JSON from the start.
+    QJsonArray mapped;
+    for (const QVariant &entry : answers) {
+        const QVariantMap map = entry.toMap();
+        const QString question = map.value(QStringLiteral("question")).toString();
+        const QString label = map.value(QStringLiteral("label")).toString();
+        if (question.isEmpty() || label.isEmpty()) {
+            qWarning() << "codeisland-shell: answer() dropped: incomplete pair" << map;
+            return;
+        }
+        mapped.append(QJsonObject{
+            {QStringLiteral("question"), question},
+            {QStringLiteral("label"), label},
+        });
+    }
+
+    // Answering a question *is* allowing the tool; the CLI only wants the rewritten
+    // input back, which the daemon builds from these pairs.
+    QJsonObject payload{
+        {QStringLiteral("type"), QStringLiteral("permission_decision")},
+        {QStringLiteral("request_id"), requestId},
+        {QStringLiteral("behavior"), QStringLiteral("allow")},
+        {QStringLiteral("answers"), mapped},
+    };
+    writeDecision(payload);
+}
+
+void DaemonClient::jump(const QString &sessionId)
+{
+    qInfo() << "codeisland-shell: jump() called" << sessionId;
+    if (sessionId.isEmpty()) {
+        qWarning() << "codeisland-shell: jump() dropped: empty session id";
+        return;
+    }
+    if (m_socket->state() != QLocalSocket::ConnectedState) {
+        qWarning() << "codeisland-shell: jump dropped, daemon not connected";
+        return;
+    }
+    QJsonObject payload{
+        {QStringLiteral("type"), QStringLiteral("jump")},
+        {QStringLiteral("session_id"), sessionId},
+    };
+    QByteArray line = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    line.append('\n');
+    if (m_socket->write(line) < 0) {
+        qWarning() << "codeisland-shell: failed to send jump" << m_socket->errorString();
+    }
+}
+
+void DaemonClient::writeDecision(const QJsonObject &payload)
+{
+    QByteArray line = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    line.append('\n');
+
+    if (m_socket->state() != QLocalSocket::ConnectedState) {
+        // The daemon already released this hook when our connection dropped, so
+        // there is nothing to answer. Say so instead of pretending.
+        qWarning() << "codeisland-shell: decision dropped, daemon not connected";
+        return;
+    }
+    qInfo() << "codeisland-shell: sending decision" << line.trimmed();
+    if (m_socket->write(line) < 0) {
+        qWarning() << "codeisland-shell: failed to send decision" << m_socket->errorString();
+    }
+    m_socket->flush();
+}
+
 void DaemonClient::connectToDaemon()
 {
     if (m_stopping) {
         return;
     }
     const QString path = resolveViewSocketPath();
-    // QLocalSocket takes the trailing slash off absolute paths itself, so pass
-    // the path exactly as the daemon bound it.
+    // ReadWrite, not ReadOnly. The island both receives updates and sends
+    // decisions; opening read-only made every button click fail at write() with
+    // "QIODevice::write (QLocalSocket): ReadOnly device" while looking from the
+    // outside like the click had never arrived at all.
     m_buffer.clear();
     m_socket->abort();
-    m_socket->connectToServer(path, QIODevice::ReadOnly);
+    m_socket->connectToServer(path, QIODevice::ReadWrite);
 }
 
 void DaemonClient::consumeBuffer()
@@ -137,12 +257,21 @@ void DaemonClient::consumeBuffer()
 
         const QJsonObject object = document.object();
         const QString type = object.value(QStringLiteral("type")).toString();
+        // One line per message. Without this a card that never appeared was
+        // indistinguishable from a message that never arrived.
+        qInfo() << "codeisland-shell: received" << type;
         if (type == QStringLiteral("snapshot")) {
             m_model->applySnapshot(object.value(QStringLiteral("sessions")).toVariant().toList());
         } else if (type == QStringLiteral("session_upsert")) {
             m_model->applyUpsert(object.value(QStringLiteral("session")).toVariant().toMap());
         } else if (type == QStringLiteral("session_remove")) {
             m_model->applyRemove(object.value(QStringLiteral("id")).toString());
+        } else if (type == QStringLiteral("permission_requested")) {
+            m_permissions->addRequest(
+                object.value(QStringLiteral("request")).toVariant().toMap());
+        } else if (type == QStringLiteral("permission_resolved")) {
+            m_permissions->resolveRequest(
+                object.value(QStringLiteral("request_id")).toString());
         }
     }
 }

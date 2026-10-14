@@ -8,10 +8,12 @@
 // card. The daemon answers permission requests with silence in that window, which
 // hands the decision back to the CLI -- the safety contract, unchanged.
 
+#include <QJsonObject>
 #include <QObject>
 #include <QTimer>
 
 class QLocalSocket;
+class PermissionModel;
 class SessionsModel;
 
 class DaemonClient final : public QObject
@@ -20,7 +22,8 @@ class DaemonClient final : public QObject
     Q_PROPERTY(bool connected READ isConnected NOTIFY connectedChanged)
 
 public:
-    explicit DaemonClient(SessionsModel *model, QObject *parent = nullptr);
+    explicit DaemonClient(SessionsModel *model, PermissionModel *permissions,
+                          QObject *parent = nullptr);
     ~DaemonClient() override;
 
     bool isConnected() const { return m_connected; }
@@ -30,6 +33,27 @@ public:
     Q_INVOKABLE void start();
     Q_INVOKABLE void stop();
 
+    /// Hand a human's decision back to the daemon.
+    ///
+    /// `behavior` is "allow" or "deny". Anything else is dropped rather than
+    /// guessed: a malformed click must not silently become an approval.
+    Q_INVOKABLE void decide(const QString &requestId, const QString &behavior);
+
+    /// Answer a question card. `answers` is a list of {question, label} maps, one
+    /// per question, each label taken from that question's own options.
+    ///
+    /// A question cannot be answered with `decide()`: approving `AskUserQuestion`
+    /// without an answer would run the tool with its questions still open, and the
+    /// daemon refuses that combination rather than passing it on.
+    Q_INVOKABLE void answer(const QString &requestId, const QVariantList &answers);
+
+    /// Bring the terminal this session runs in to the front.
+    ///
+    /// A view action only: it does not answer anything, and the daemon keeps the
+    /// hook parked. If the terminal cannot be found the daemon logs why and the
+    /// card simply stays where it is.
+    Q_INVOKABLE void jump(const QString &sessionId);
+
 signals:
     void connectedChanged();
 
@@ -37,8 +61,12 @@ private:
     void connectToDaemon();
     void consumeBuffer();
     void scheduleReconnect();
+    /// Serialise and send one decision. Both `decide()` and `answer()` go through
+    /// here so the socket-state check and the logging cannot drift apart.
+    void writeDecision(const QJsonObject &payload);
 
     SessionsModel *m_model;
+    PermissionModel *m_permissions;
     QLocalSocket *m_socket;
     QTimer m_retry;
     QByteArray m_buffer;

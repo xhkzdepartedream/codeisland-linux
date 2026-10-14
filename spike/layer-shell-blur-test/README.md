@@ -29,7 +29,7 @@
 |---|---|---|
 | 附加类型和 `QtQuick.Window` 的 `Window` **重名** | 不加限定就 import，根对象变成那个 `isCreatable: false` 的附加类型，报 `Type cannot be created in QML` | `import org.kde.layershell as LS` |
 | 附加属性写法 | `Window.layer` 报 `Cannot assign to non-existent property "layer"` | 写成 `LS.Window.layer: LS.Window.LayerOverlay` |
-| `margins` 是 `QMargins`，QML 里没有对应的值类型包装 | **不能从 QML 赋值** | 绕开：表面铺满整条顶边，胶囊画在正中间（正式界面本来也要这样，因为岛要横向展开） |
+| `margins` 是 `QMargins` | 写成 `QtMargins { ... }` 会报 `QtMargins is not a type` | **可以直接赋 JS 对象**：`LS.Window.margins: ({left:600, top:40, right:600, bottom:0})`。实测表面被精确移到逻辑坐标 x=600,y=40。（本文件此前记的"不能从 QML 赋值"是错的，只试了 `QtMargins {}` 一种写法就下了结论） |
 | `qml6` 运行时不报 QML 加载错误 | 任何错误都只有一句 `Did not load any objects, exiting.` | 用 `qmlscene6`（它会打印 `file:line:col` 真实错误），或用 C++ 启动器 |
 
 另外：`import QtQuick, QtQuick.Window` 这种逗号写法 QML **不接受**，必须一行一个 import。

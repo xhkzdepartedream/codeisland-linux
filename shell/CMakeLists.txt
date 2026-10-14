@@ -16,6 +16,7 @@ set(CODEISLAND_QML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/qml" CACHE STRING
 qt_add_executable(codeisland-shell
     src/main.cpp
     src/daemon_client.cpp
+    src/permission_model.cpp
     src/sessions_model.cpp
 )
 

@@ -5,16 +5,21 @@
 // implemented yet, so this process cannot approve anything -- see the phase plan.
 
 #include "daemon_client.h"
+#include "permission_model.h"
 #include "sessions_model.h"
 #include "surface.h"
 
 #include <QCommandLineParser>
+#include <QLockFile>
 #include <QCoreApplication>
 #include <QGuiApplication>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickWindow>
 #include <QScreen>
+#include <QStandardPaths>
+#include <QTimer>
+#include <QDir>
 #include <QUrl>
 
 /// Put the island on a chosen screen.
@@ -58,9 +63,11 @@ static bool selectScreen(QQuickWindow *window, const QString &requested)
     }
 
     window->setScreen(target);
-    // Move first, then let QML size it: an anchored layer-shell surface is placed
-    // by its screen, so the origin has to be that screen's origin.
-    window->setGeometry(target->geometry());
+    // Position only, never size. Setting the whole screen geometry here turned a
+    // 260x34 pill into a 1536x960 transparent surface that ate every click on the
+    // laptop screen; QML sizes the window to the pill and centres it with margins.
+    window->setX(target->geometry().x());
+    window->setY(target->geometry().y());
     return true;
 }
 
@@ -114,11 +121,34 @@ int main(int argc, char *argv[])
         return 0;
     }
 
+    // One island per machine. Test harnesses used to leave several alive at
+    // once, which made "click the button" meaningless -- the capsule on screen
+    // was not necessarily the one under test, and each one covered the last.
+    // The lock is held by a QFile-like object that releases it when the process
+    // exits, including on a crash.
+    QLockFile singleInstanceLock(
+        QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation))
+            .filePath(QStringLiteral("codeisland-shell.lock")));
+    // Default stale time (30 s) is what we want: a shell that was killed keeps
+    // its lock briefly so a racing harness cannot stack a second island on top,
+    // but a machine that really did crash recovers on its own.
+    if (!singleInstanceLock.tryLock(100)) {
+        qint64 ownerPid = 0;
+        QString hostname, appname;
+        singleInstanceLock.getLockInfo(&ownerPid, &hostname, &appname);
+        qWarning().noquote()
+            << "codeisland-shell: another island is already running (pid"
+            << ownerPid << "on" << hostname << ") -- refusing to start a second one";
+        return 4;
+    }
+
     QQmlApplicationEngine engine;
 
     SessionsModel model;
-    DaemonClient client(&model);
+    PermissionModel permissions;
+    DaemonClient client(&model, &permissions);
     engine.rootContext()->setContextProperty(QStringLiteral("sessions"), &model);
+    engine.rootContext()->setContextProperty(QStringLiteral("permissions"), &permissions);
     engine.rootContext()->setContextProperty(QStringLiteral("daemon"), &client);
 
     const QUrl url = QUrl::fromLocalFile(
@@ -133,8 +163,29 @@ int main(int argc, char *argv[])
         if (!selectScreen(window, parser.value(screenOption))) {
             return 3;
         }
+        // Log where the surface actually landed. Coordinates for clicking the
+        // buttons are derived from this, not guessed from a screenshot region --
+        // guessing is what sent a run of clicks to the wrong screen.
+        qInfo().noquote() << QStringLiteral("codeisland-shell: screen=%1 geometry=%2,%3 %4x%5 dpr=%6")
+                                 .arg(window->screen() ? window->screen()->name() : QStringLiteral("?"))
+                                 .arg(window->geometry().x())
+                                 .arg(window->geometry().y())
+                                 .arg(window->geometry().width())
+                                 .arg(window->geometry().height())
+                                 .arg(window->screen() ? window->screen()->devicePixelRatio() : 1.0);
     }
 
     client.start();
+
+    // Re-report the geometry after the first layout pass, because the QML margins
+    // binding only settles once the window has been configured by the compositor.
+    QTimer::singleShot(700, window, [window] {
+        qInfo().noquote() << QStringLiteral("codeisland-shell: after layout geometry=%1,%2 %3x%4")
+                                 .arg(window->geometry().x())
+                                 .arg(window->geometry().y())
+                                 .arg(window->geometry().width())
+                                 .arg(window->geometry().height());
+    });
+
     return application.exec();
 }
