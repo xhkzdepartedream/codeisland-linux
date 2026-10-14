@@ -14,6 +14,8 @@
 | 3 | 回答问题、跳转终端、桌面通知、hook 自动安装 | 进行中：**hook 自动安装 + 复查完成**（2026-10-13，`codeisland-hookctl`）；**提问卡完成**（2026-10-14，单选问题；契约见 `docs/协议.md`） |
 | 4 | 多 CLI 铺开、SSH 远程、推送渠道 | **codex、pi 已接入**（pi 走扩展适配器 `integrations/pi/codeisland.ts`，三例实测：批准生成文件、驳回不生成且无 `PostToolUse`、岛不在场时由 pi 自己决定）；进行中：**codex 已可安装**（2026-10-14：`codeisland-hookctl --source codex` 写项目级 `.codex/hooks.json`，审批闭环实测通过，信任可一次授予并持久化；codex 另有文件夹信任这道前置门，见 `docs/协议.md`） |
 
+阶段 4 的 codex、pi 已接入，但两者都只在 **hook 装好之后**启动的 agent 才说话。所以另加了**发现层**（2026-10-14，`crates/codeisland-daemon/src/discover.rs`）：走 `/proc` 找到活着的 claude/codex/pi 进程，配上它拥有的存档文件，于是 hook 装之前就开着的会话也能看见。它只能推断 `working`/`idle`——没有 socket 就证明不了「卡在等人回答」——所以界面把这类行标成 `源 ·推断`。边界见 `docs/协议.md`。
+
 阶段 0 没有界面，所以常驻程序**故意不回答**权限请求——它保持沉默，让 agent 回落到自己的权限提示。见下面「安全契约」。
 
 提问卡只回答**已实测确认的形状**：`AskUserQuestion` 以 `PermissionRequest` 到达，回答 = `allow` + `updatedInput`（原 `questions` 保留，加 `answers` 与 `annotations`）。`multiSelect`、文本/数字类问题在上游载荷里尚未观测到，所以 daemon 直接**不 park**——agent 回落到终端自己的提问，而不是被胶囊猜一个答案。验收两条：`cargo test`（含"点错形状必须被拒"的不变量）与真 pty 会话——脚本化 viewer 选 `Blue`，journal 的 `PostToolUse` 里出现 `answers: {"…": "Blue"}`，而提交指令后**没有再按过任何键**。
@@ -143,16 +145,21 @@ systemctl --user daemon-reload && systemctl --user enable --now codeisland-daemo
 
 违反后果不对称：自动批准是安全漏洞，卡住是可用性事故，两者都比"没有这个工具"严重得多。所以超时都是有界的，且桥接程序装了 panic hook，panic 时也走 exit 0。
 
-## 两条链路
+## 三条链路
 
 ```
+链路一（agent 亲自说话）
 AI CLI ──触发 hook──▶ codeisland-bridge ──unix socket──▶ codeisland-daemon ──▶ 界面
                         (短命进程)        /tmp/codeisland-<uid>.sock        (阶段 1+)
                             ▲                                                    │
                             └────────── 权限决策原路返回（标准输出）◀─────────────┘
+
+链路二（agent 不说话也能看见）
+活着的 claude/codex/pi 进程 ──配对──▶ 它拥有的存档文件 ──▶ daemon 扫描线程 ──▶ 界面
+     (/proc 可执行文件名，非命令行子串)   (cwd 取自头部，按大小缓存)      (每 5s)
 ```
 
-报文格式见 [`docs/协议.md`](docs/协议.md)。
+链路二只能推断 `working`/`idle`，界面标 `源 ·推断`；链路一才是「有 socket 为证」的状态。报文格式见 [`docs/协议.md`](docs/协议.md)。
 
 ## 目录
 
@@ -160,7 +167,7 @@ AI CLI ──触发 hook──▶ codeisland-bridge ──unix socket──▶ c
 |---|---|
 | `crates/codeisland-core/` | 平台无关层：事件名归一化、线协议、socket 路径 |
 | `crates/codeisland-bridge/` | 每次 hook 事件启动一次的短命进程 |
-| `crates/codeisland-daemon/` | 常驻：监听 socket、维护会话状态、写事件日志 |
+| `crates/codeisland-daemon/` | 常驻：监听 socket、维护会话状态、写事件日志、发现未装 hook 的会话 |
 | `shell/` | 顶部胶囊界面（阶段 1 起） |
 | `packaging/systemd/user/` | 常驻程序的 systemd 用户服务 |
 | `scripts/` | 冒烟测试等运维脚本 |
