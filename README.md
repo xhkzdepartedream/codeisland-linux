@@ -10,11 +10,56 @@
 |---|---|---|
 | 0 | 管道打通：hook → 桥接 → 常驻程序 → 事件日志 | **完成**（真实 claude/haiku 四组用例通过） |
 | 1 | 界面：顶部居中悬浮胶囊 | **完成**（`scripts/visual-check.py` 四项像素级断言通过） |
-| 2 | 批准闭环：在胶囊上批准/拒绝工具调用 | 未开始（有一个前提待确认，见下） |
-| 3 | 回答问题、跳转终端、桌面通知、hook 自动安装 | 未开始 |
-| 4 | 多 CLI 铺开、SSH 远程、推送渠道 | 未开始 |
+| 2 | 批准闭环：在胶囊上批准/拒绝工具调用 | **完成**（2026-10-13） |
+| 3 | 回答问题、跳转终端、桌面通知、hook 自动安装 | 进行中：**hook 自动安装 + 复查完成**（2026-10-13，`codeisland-hookctl`）；**提问卡完成**（2026-10-14，单选问题；契约见 `docs/协议.md`） |
+| 4 | 多 CLI 铺开、SSH 远程、推送渠道 | 进行中：**codex 审批闭环实测通过**（2026-10-14，桥接与常驻程序零改动；信任可一次授予并持久化，见 `docs/协议.md`） |
 
 阶段 0 没有界面，所以常驻程序**故意不回答**权限请求——它保持沉默，让 agent 回落到自己的权限提示。见下面「安全契约」。
+
+提问卡只回答**已实测确认的形状**：`AskUserQuestion` 以 `PermissionRequest` 到达，回答 = `allow` + `updatedInput`（原 `questions` 保留，加 `answers` 与 `annotations`）。`multiSelect`、文本/数字类问题在上游载荷里尚未观测到，所以 daemon 直接**不 park**——agent 回落到终端自己的提问，而不是被胶囊猜一个答案。验收两条：`cargo test`（含"点错形状必须被拒"的不变量）与真 pty 会话——脚本化 viewer 选 `Blue`，journal 的 `PostToolUse` 里出现 `answers: {"…": "Blue"}`，而提交指令后**没有再按过任何键**。
+
+阶段 2 当初留的那个「前提」是权限回复的报文格式必须和上游一致，已逐字节对照上游源码与已安装的 `claude` 二进制确认（见 `docs/协议.md`）。闭环的验收方式两条：`scripts/permission-probe.py` 跑六项行为断言（含「撤回是静默而不是 deny」「过期点击不生效」），以及截图量像素确认卡片与按钮真的画出来（窗口高度现在从内容自己推，不再手算）。
+
+### 装 hook（阶段 3）
+
+```bash
+# 项目级（默认，安全）：写 ./.claude/settings.json
+cd 你的项目 && ~/apps/codeisland-linux/target/release/codeisland-hookctl install
+
+# 复查：hook 还在不在、还指向当前桥接程序吗
+codeisland-hookctl verify            # 有问题退出码 1，并说明是哪一项
+
+# 全局（~/.claude/settings.json）要显式指定：Claude Code 改配置时会整体重生成
+# 这个文件、不保留外部注入的键，所以装完得靠 verify 复查
+codeisland-hookctl install --scope user
+```
+
+`install` 只补自己的条目：无关键（`model`、`autoMemoryEnabled`、`permissions`…）和用户自己
+在同一个事件上的 hook 一律原样保留；改动前留一份带 UTC 时间戳的备份；写完**读回来复查**。
+
+### 桌面通知（阶段 3）
+
+通知走桌面自己的服务（freedesktop `org.freedesktop.Notifications`，本机由 plasmashell 拥有），实现方式是调用 `notify-send` —— 不引入 D-Bus 客户端依赖，也不自己实现协议。措辞分两种：卡片已经显示时是「`<项目>` 需要你 / `<摘要>`」，**没有界面连接时**额外注明「（界面未连接，请在终端里回答）」，因为那种情况下终端是唯一还能回答的地方。
+
+四条硬约束，都带测试：
+
+- **绝不为通知卡住 agent**：发送在独立线程上完成，钩子线程只往一个容量 4 的队列里塞，塞满就丢（迟到的「需要你」比不发更坏）
+- **卡死的通知进程会被杀掉**（3 秒）：这台机器上出过一次「通知服务缺席」的事故，症状不是报错而是 `notify-send` 挂 25~60 秒（见 vault `facts/本机/修复/QQ闪退缺通知applet`）
+- **同一会话 5 秒内只通知一次**，不同会话互不影响
+- 通知**从不改变安全契约**：它只是提醒，agent 等到的仍然是「人给了答案」或者「静默」
+
+通知**自动 5 秒过期**（`--expire-time 5000`），不会堆在角落里等人关掉。环境里没有 `DBUS_SESSION_BUS_ADDRESS` 时（纯 SSH 会话常见），会填上本机用户总线 `unix:path=/run/user/<uid>/bus` 再发。
+
+两个配置项，都是环境变量（项目的配置面清一色如此，不另起配置文件）：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `CODEISLAND_NOTIFY_ON_STOP` | 开 | 一轮结束（`Stop`）是否也通知。写成 `0`/`false`/`off`/`no` 才静音；**空值或半填不算静音**，因为那通常是 drop-in 写漏了 |
+| `CODEISLAND_NOTIFY_PROGRAM` | `notify-send` | 换掉发送程序，测试用它数通知条数 |
+
+systemd 下改法：`systemctl --user edit codeisland-daemon` 加一行
+`Environment=CODEISLAND_NOTIFY_ON_STOP=0`。没有通知服务时发送失败只在日志里留一行，
+**胶囊与批准流程完全不受影响**——通知是提醒，能解开 agent 的只有卡片或终端里的回答。
 
 ## 怎么跑
 
