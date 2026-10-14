@@ -33,6 +33,8 @@ QVariant SessionsModel::data(const QModelIndex &index, int role) const
         return row.detail;
     case OriginRole:
         return row.origin;
+    case BranchRole:
+        return row.branch;
     case ToolCallsRole:
         return row.toolCalls;
     case LastEventMsRole:
@@ -53,6 +55,7 @@ QHash<int, QByteArray> SessionsModel::roleNames() const
         {ProjectRole, "project"},
         {DetailRole, "detail"},
         {OriginRole, "origin"},
+        {BranchRole, "branch"},
         {ToolCallsRole, "toolCalls"},
         {LastEventMsRole, "lastEventMs"},
         {StartedMsRole, "startedMs"},
@@ -78,6 +81,7 @@ void SessionsModel::applyUpsert(const QVariantMap &session)
         // reading is the safe default.
         row.origin = QStringLiteral("hook");
     }
+    row.branch = session.value(QStringLiteral("branch")).toString();
     row.toolCalls = session.value(QStringLiteral("tool_calls")).toInt();
     row.lastEventMs = static_cast<qint64>(session.value(QStringLiteral("last_event_ms")).toDouble());
     row.startedMs = static_cast<qint64>(session.value(QStringLiteral("started_ms")).toDouble());
@@ -132,6 +136,7 @@ void SessionsModel::applySnapshot(const QVariantList &sessions)
         if (row.origin.isEmpty()) {
             row.origin = QStringLiteral("hook");
         }
+        row.branch = map.value(QStringLiteral("branch")).toString();
         row.toolCalls = map.value(QStringLiteral("tool_calls")).toInt();
         row.lastEventMs = static_cast<qint64>(map.value(QStringLiteral("last_event_ms")).toDouble());
         row.startedMs = static_cast<qint64>(map.value(QStringLiteral("started_ms")).toDouble());

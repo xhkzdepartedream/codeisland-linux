@@ -617,6 +617,7 @@ delegate: Rectangle {
                     required property string status
                     required property string project
                     required property string detail
+                    required property string branch
                     required property real lastEventMs
 
                     // The list is capped so a long tail of sessions cannot push the
@@ -633,7 +634,15 @@ delegate: Rectangle {
                     border.width: 1
                     readonly property bool blocked:
                         status === "waiting_approval" || status === "waiting_input"
-                    border.color: blocked ? island.statusColor(status) : "#2c2c2e"
+                    // `AnimatedImage.source` shadows the delegate's `source`, so the mascot path
+                    // is built here where the session's source is unambiguous.
+                    readonly property string mascotPath:
+                        source.length > 0 ? "assets/mascots/" + source + ".gif" : ""
+                    // A finished session gets the mint border upstream uses, so "done" is
+                    // visible while scanning the list rather than only in the status word.
+                    border.color: blocked
+                                  ? island.statusColor(status)
+                                  : (status === "done" ? "#63e6be" : "#2c2c2e")
 
                     RowLayout {
                         anchors.fill: parent
@@ -641,32 +650,72 @@ delegate: Rectangle {
                         anchors.rightMargin: 12
                         spacing: 10
 
-                        Rectangle {
-                            Layout.preferredWidth: 12
-                            Layout.preferredHeight: 12
+                        // The tool's own mascot, not a colour dot. Upstream's cards lead
+                        // with a pixel character per CLI, and it is the fastest way to see
+                        // *which* agent a row is -- reading the source name takes longer.
+                        // One animated GIF per supported tool; an unknown source falls back
+                        // to the status dot so the row never renders empty.
+                        Item {
+                            Layout.preferredWidth: 32
+                            Layout.preferredHeight: 32
                             Layout.alignment: Qt.AlignVCenter
-                            radius: 6
-                            color: island.statusColor(status)
-                            // Static colour per card. Blinking *every* card is what
-                            // cost CPU: five opacity interpolations repainted the
-                            // whole surface 30+ times a second (measured 15.25% of a
-                            // core, then 6.00% with a shared discrete phase). One
-                            // marker in the header carries the "you are needed"
-                            // signal instead -- see the attention timer below.
-                            readonly property bool blocked:
-                                status === "waiting_approval" || status === "waiting_input"
+
+                            AnimatedImage {
+                                id: mascot
+                                anchors.centerIn: parent
+                                width: 32
+                                height: 32
+                                // QML resolves this relative to the .qml file, so it works
+                                // from the source tree and from a packaged copy alike.
+                                // AnimatedImage, not Image: a plain Image shows GIF frame 1
+                                // only, which would look static next to the real thing.
+                                source: mascotPath
+                                // 128x128 art scaled to 32: smoothing off keeps the pixel
+                                // edges crisp instead of turning the character into a blur.
+                                smooth: false
+                                fillMode: Image.PreserveAspectFit
+                                playing: true
+                                // Hidden (not merely transparent) when there is no asset, so
+                                // the fallback dot below takes the slot.
+                                visible: mascotPath.length > 0 && status !== AnimatedImage.Error
+                            }
+
+                            // Fallback: the status dot, shown only while there is no mascot to
+                            // show (a source with no asset, or one that failed to load).
+                            Rectangle {
+                                anchors.centerIn: parent
+                                width: 12
+                                height: 12
+                                radius: 6
+                                color: island.statusColor(status)
+                                visible: mascot.status !== AnimatedImage.Ready
+                            }
                         }
 
                         Column {
                             Layout.fillWidth: true
                             spacing: 3
-                            Text {
+                            RowLayout {
                                 width: parent.width
-                                text: project
-                                color: "#f2f2f2"
-                                font.pixelSize: 14
-                                font.bold: true
-                                elide: Text.ElideRight
+                                spacing: 6
+                                Text {
+                                    Layout.fillWidth: true
+                                    text: project
+                                    color: "#f2f2f2"
+                                    font.pixelSize: 14
+                                    font.bold: true
+                                    elide: Text.ElideRight
+                                }
+                                // Git branch: the second thing a human uses to tell two
+                                // sessions in the same project apart.
+                                Text {
+                                    visible: branch && branch.length > 0
+                                    text: (branch && branch.length > 0 ? "\u2387 " + branch : "")
+                                    color: "#8e8e93"
+                                    font.pixelSize: 11
+                                    elide: Text.ElideRight
+                                    Layout.maximumWidth: 160
+                                }
                             }
                             Text {
                                 width: parent.width
@@ -682,19 +731,38 @@ delegate: Rectangle {
                         Column {
                             Layout.alignment: Qt.AlignVCenter
                             spacing: 2
+                            // Status word in the state's colour, tinted like upstream's chip.
+                            // "working" is the unremarkable case and stays grey so the eye
+                            // lands on the rows that need something.
+                            Rectangle {
+                                Layout.alignment: Qt.AlignRight
+                                radius: 6
+                                implicitWidth: statusLabel.implicitWidth + 12
+                                implicitHeight: statusLabel.implicitHeight + 4
+                                color: status === "working" || status === "idle"
+                                       ? "#2c2c2e"
+                                       : Qt.rgba(0, 0, 0, 0)
+                                border.width: status === "working" || status === "idle" ? 0 : 1
+                                border.color: island.statusColor(status)
+
+                                Text {
+                                    id: statusLabel
+                                    anchors.centerIn: parent
+                                    text: island.statusText(status)
+                                    color: status === "working" || status === "idle"
+                                           ? "#98989d"
+                                           : island.statusColor(status)
+                                    font.pixelSize: 11
+                                }
+                            }
                             Text {
+                                Layout.alignment: Qt.AlignRight
                                 // A discovered row is a statement about a file's mtime, not
                                 // about what an agent is waiting for -- say so on the row
                                 // rather than letting an inference look like a report.
-                                text: origin === "discovered" ? source + " ·推断" : source
+                                text: (origin === "discovered" ? source + " ·推断" : source)
+                                      + " · " + island.humanize(island.nowMs - lastEventMs)
                                 color: "#636366"
-                                font.pixelSize: 11
-                            }
-                            Text {
-                                text: island.humanize(island.nowMs - lastEventMs)
-                                color: status === "waiting_approval"
-                                       || status === "waiting_input"
-                                       ? island.statusColor(status) : "#636366"
                                 font.pixelSize: 11
                                 horizontalAlignment: Text.AlignRight
                             }
