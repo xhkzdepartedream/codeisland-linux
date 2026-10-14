@@ -4,6 +4,7 @@ members = [
     "crates/codeisland-core",
     "crates/codeisland-bridge",
     "crates/codeisland-daemon",
+    "crates/codeisland-hookctl",
 ]
 
 [workspace.package]

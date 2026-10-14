@@ -15,3 +15,7 @@ events.jsonl
 
 # Local smoke-test scratch space.
 /tmp-smoke
+
+# python harness scratch
+__pycache__/
+*.pyc

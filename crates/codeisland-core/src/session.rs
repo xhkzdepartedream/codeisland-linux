@@ -99,6 +99,67 @@ pub enum ViewUpdate {
     SessionUpsert { session: Session },
     /// One session is gone.
     SessionRemove { id: String },
+    /// A tool call is waiting for this client's yes/no. The hook process is
+    /// parked on its socket until a `ViewCommand::PermissionDecision` arrives or
+    /// the request is withdrawn.
+    PermissionRequested { request: PermissionRequestView },
+    /// The request no longer needs an answer -- answered elsewhere, timed out, or
+    /// the agent gave up waiting. The UI must drop its card.
+    PermissionResolved { request_id: String },
+}
+
+/// A pending permission request as the island needs to see it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionRequestView {
+    /// Correlates the decision back to the parked hook connection.
+    pub request_id: String,
+    pub session_id: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// What the tool is about to do, already reduced to one display line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Set for a question card (`AskUserQuestion`): what to offer. Empty for a
+    /// plain approve/deny gate, and skipped on the wire so an older client sees
+    /// exactly the shape it already knows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<crate::question::Question>,
+}
+
+/// One picked option, as the UI reports it back.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerChoice {
+    /// The question text, which is the key `answers` is stored under.
+    pub question: String,
+    /// The option label. Must be one this question offered -- the daemon checks,
+    /// because inventing a label would put words in the human's mouth.
+    pub label: String,
+}
+
+/// A command the UI sends back to the daemon.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ViewCommand {
+    /// The human answered. `behavior` is the decision to hand back to the agent,
+    /// and `answers` carries the picked options when the card asked a question.
+    ///
+    /// An empty `answers` on a question card is not an answer: the daemon refuses
+    /// it rather than letting the tool run with questions still open.
+    PermissionDecision {
+        request_id: String,
+        behavior: crate::protocol::Behavior,
+        #[serde(default)]
+        answers: Vec<AnswerChoice>,
+    },
+    /// "Bring me the terminal this session is running in."
+    ///
+    /// A view action, not a decision: it must never unblock a parked hook, because
+    /// looking at the agent and answering it are different choices. A client that
+    /// cannot jump (an older shell, or a remote viewer) simply does not send this.
+    Jump { session_id: String },
 }
 
 /// All live sessions.
@@ -232,6 +293,39 @@ impl SessionRegistry {
         self.sessions.insert(id, session);
         Some(update)
     }
+
+    /// The human gate on this session is over: its card was answered, withdrawn,
+    /// or nobody was watching to be asked in the first place.
+    ///
+    /// Only a session actually parked on approval moves, and it moves to
+    /// `Working` -- either the tool is now running or the agent has fallen back to
+    /// prompting itself, and both mean it stopped waiting on this island.
+    ///
+    /// Without this the flags set by `RouteKind::Permission` and `RouteKind::Question`
+    /// outlive every card:
+    /// the header keeps reading "1 session needs you" with nothing in it to
+    /// answer, which is indistinguishable from a card that failed to draw.
+    ///
+    /// Returns the update to broadcast, or `None` when there was nothing to
+    /// release. Callers must check that no *other* request from the same session
+    /// is still parked before calling -- two cards can be up at once.
+    pub fn release_request(&mut self, session_id: &str) -> Option<ViewUpdate> {
+        let session = self.sessions.get_mut(session_id)?;
+        // Both "waiting" states mean the island was asked to act: a permission gate
+        // and, since the question card, an `AskUserQuestion`. Either must be cleared
+        // when nobody is left to act, or the header will read "needs you" forever
+        // with nothing to answer.
+        if !matches!(
+            session.status,
+            SessionStatus::WaitingApproval | SessionStatus::WaitingInput
+        ) {
+            return None;
+        }
+        session.status = SessionStatus::Working;
+        Some(ViewUpdate::SessionUpsert {
+            session: session.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +340,17 @@ mod tests {
             session_id: Some(session.into()),
             cwd: Some("/home/dev/projects/my-app".into()),
             ..Default::default()
+        }
+    }
+
+    /// The shape measured on 2026-10-14: a question arrives on the *permission*
+    /// channel with the AskUserQuestion tool name, and must route to Question.
+    fn question_event(session: &str) -> HookEvent {
+        HookEvent {
+            tool_name: Some(crate::question::ASK_TOOL.into()),
+            tool_input: Some(serde_json::json!({"questions": [
+                {"question": "Red or blue?", "options": [{"label": "Red"}, {"label": "Blue"}]}]})),
+            ..event("PermissionRequest", session)
         }
     }
 
@@ -274,6 +379,53 @@ mod tests {
         reg.apply(&e, 2000);
         assert_eq!(reg.get("s1").unwrap().status, SessionStatus::WaitingApproval);
         assert_eq!(reg.get("s1").unwrap().detail.as_deref(), Some("Bash: rm -rf /tmp/x"));
+    }
+
+    #[test]
+    fn releasing_a_permission_parks_nothing_afterwards() {
+        let mut reg = SessionRegistry::new();
+        reg.apply(&event("SessionStart", "s1"), 1000);
+        let mut e = event("PermissionRequest", "s1");
+        e.tool_name = Some("Bash".into());
+        reg.apply(&e, 2000);
+        assert_eq!(reg.get("s1").unwrap().status, SessionStatus::WaitingApproval);
+
+        let update = reg.release_request("s1").expect("card gone, flag gone");
+        match update {
+            ViewUpdate::SessionUpsert { session } => {
+                assert_eq!(session.status, SessionStatus::Working)
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(reg.get("s1").unwrap().status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn a_waiting_input_session_is_released_too() {
+        // The question card parks on RouteKind::Question, which sets WaitingInput.
+        // If only WaitingApproval were cleared, an unanswerable question would leave
+        // the phantom "needs you" header we removed on 2026-10-13.
+        let mut reg = SessionRegistry::default();
+        reg.apply(&event("SessionStart", "s9"), 1_000);
+        reg.apply(&question_event("s9"), 1_100);
+        assert_eq!(reg.get("s9").unwrap().status, SessionStatus::WaitingInput);
+        assert!(reg.release_request("s9").is_some());
+        assert_eq!(reg.get("s9").unwrap().status, SessionStatus::Working);
+    }
+
+    #[test]
+    fn releasing_leaves_sessions_that_werent_waiting_alone() {
+        let mut reg = SessionRegistry::new();
+        reg.apply(&event("SessionStart", "s1"), 1000);
+        reg.apply(&event("Stop", "s1"), 2000);
+        assert!(
+            reg.release_request("s1").is_none(),
+            "a finished turn must not be dragged back to working"
+        );
+        assert_eq!(reg.get("s1").unwrap().status, SessionStatus::Done);
+
+        // An unknown session is not an error, there is simply nothing to release.
+        assert!(reg.release_request("nope").is_none());
     }
 
     #[test]
@@ -357,5 +509,157 @@ mod tests {
         assert!(SessionStatus::WaitingApproval.urgency() < SessionStatus::WaitingInput.urgency());
         assert!(SessionStatus::WaitingInput.urgency() < SessionStatus::Working.urgency());
         assert!(SessionStatus::Working.urgency() < SessionStatus::Done.urgency());
+    }
+}
+
+#[cfg(test)]
+mod permission_wire_tests {
+    use super::*;
+    use crate::protocol::Behavior;
+
+    #[test]
+    fn permission_request_round_trips_through_json() {
+        let update = ViewUpdate::PermissionRequested {
+            request: PermissionRequestView {
+                request_id: "r1".into(),
+                session_id: "s1".into(),
+                source: "claude".into(),
+                tool_name: Some("Bash".into()),
+                summary: Some("Bash: touch /tmp/x".into()),
+                cwd: Some("/home/dev".into()),
+                questions: Vec::new(),
+            },
+        };
+        let text = serde_json::to_string(&update).unwrap();
+        assert!(text.contains("\"type\":\"permission_requested\""), "{text}");
+        assert!(
+            !text.contains("questions"),
+            "a plain gate must not grow a questions field: {text}"
+        );
+        let back: ViewUpdate = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, update);
+    }
+
+    #[test]
+    fn a_question_card_travels_with_its_options() {
+        let update = ViewUpdate::PermissionRequested {
+            request: PermissionRequestView {
+                request_id: "q1".into(),
+                session_id: "s1".into(),
+                source: "claude".into(),
+                tool_name: Some(crate::question::ASK_TOOL.into()),
+                summary: Some("AskUserQuestion".into()),
+                cwd: Some("/home/dev".into()),
+                questions: vec![crate::question::Question {
+                    header: "Color".into(),
+                    question: "Red or blue?".into(),
+                    options: vec![
+                        crate::question::QuestionOption {
+                            label: "Red".into(),
+                            description: "The red option.".into(),
+                        },
+                        crate::question::QuestionOption {
+                            label: "Blue".into(),
+                            description: String::new(),
+                        },
+                    ],
+                }],
+            },
+        };
+        let text = serde_json::to_string(&update).unwrap();
+        let back: ViewUpdate = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, update, "the shell has to receive every option verbatim");
+        assert!(text.contains("Red or blue?"), "{text}");
+    }
+
+    /// The shell that predates question cards sends no `answers` at all. Defaulting
+    /// it keeps that message valid instead of failing the whole command.
+    #[test]
+    fn a_jump_command_names_only_the_session() {
+        // Deliberately carries no request id: jumping must not be mistaken for an
+        // answer, and the session is what owns a terminal.
+        let command: ViewCommand =
+            serde_json::from_str(r#"{"type":"jump","session_id":"s7"}"#).unwrap();
+        match command {
+            ViewCommand::Jump { session_id } => assert_eq!(session_id, "s7"),
+            other => panic!("unexpected {other:?}"),
+        }
+        let text = serde_json::to_string(&ViewCommand::Jump {
+            session_id: "s7".into(),
+        })
+        .unwrap();
+        assert_eq!(text, r#"{"type":"jump","session_id":"s7"}"#, "{text}");
+    }
+
+    #[test]
+    fn a_decision_without_answers_still_parses() {
+        let command: ViewCommand = serde_json::from_str(
+            r#"{"type":"permission_decision","request_id":"r3","behavior":"allow"}"#,
+        )
+        .unwrap();
+        match command {
+            ViewCommand::PermissionDecision { request_id, answers, .. } => {
+                assert_eq!(request_id, "r3");
+                assert!(answers.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn answers_arrive_as_question_label_pairs() {
+        let command: ViewCommand = serde_json::from_str(
+            r#"{"type":"permission_decision","request_id":"q1","behavior":"allow",
+                "answers":[{"question":"Red or blue?","label":"Blue"}]}"#,
+        )
+        .unwrap();
+        match command {
+            ViewCommand::PermissionDecision { answers, .. } => {
+                assert_eq!(
+                    answers,
+                    vec![AnswerChoice {
+                        question: "Red or blue?".into(),
+                        label: "Blue".into()
+                    }]
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decision_carries_the_allow_deny_word_the_shell_will_send() {
+        let command = ViewCommand::PermissionDecision {
+            request_id: "r1".into(),
+            behavior: Behavior::Allow,
+            answers: Vec::new(),
+        };
+        let value: serde_json::Value = serde_json::to_value(&command).unwrap();
+        assert_eq!(value["type"], "permission_decision");
+        assert_eq!(value["behavior"], "allow");
+
+        let deny: ViewCommand =
+            serde_json::from_str(r#"{"type":"permission_decision","request_id":"r2","behavior":"deny"}"#)
+                .unwrap();
+        assert_eq!(
+            deny,
+            ViewCommand::PermissionDecision {
+                request_id: "r2".into(),
+                behavior: Behavior::Deny,
+                answers: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolved_is_withdrawal_not_an_answer() {
+        // Distinct from a decision: the UI must remove the card without the agent
+        // being told allow or deny by anyone.
+        let update = ViewUpdate::PermissionResolved {
+            request_id: "r9".into(),
+        };
+        let text = serde_json::to_string(&update).unwrap();
+        assert!(text.contains("permission_resolved"), "{text}");
+        assert!(!text.contains("behavior"), "{text}");
     }
 }

@@ -63,6 +63,33 @@ pub fn permission_response(event_name: &str, behavior: Behavior) -> String {
     )
 }
 
+/// The same envelope, carrying a rewritten tool input.
+///
+/// `updatedInput` is how a question gets answered: measured on 2026-10-14, the CLI
+/// runs `AskUserQuestion` with exactly the input handed back here, and the tool's
+/// `PostToolUse` shows it. Upstream refuses a non-object (`"an allow decision whose
+/// updatedInput is not an object"`), so a non-object is dropped rather than emitted --
+/// a reply the CLI would reject is indistinguishable from a broken bridge.
+pub fn permission_answer(
+    event_name: &str,
+    behavior: Behavior,
+    updated_input: Option<&serde_json::Value>,
+) -> String {
+    let Some(input) = updated_input.filter(|value| value.is_object()) else {
+        return permission_response(event_name, behavior);
+    };
+    let behavior = match behavior {
+        Behavior::Allow => "allow",
+        Behavior::Deny => "deny",
+    };
+    // serde_json's Display is valid JSON by construction, so interpolating the value
+    // cannot break the envelope's quoting.
+    format!(
+        r#"{{"hookSpecificOutput":{{"hookEventName":"{}","decision":{{"behavior":"{}","updatedInput":{}}}}}}}"#,
+        event_name, behavior, input
+    )
+}
+
 /// A fully parsed hook event on its way from bridge to daemon.
 ///
 /// Every field is optional except the ones we key sessions on: agent CLIs differ
@@ -99,6 +126,11 @@ pub struct HookEvent {
     /// Unix epoch milliseconds, stamped by the bridge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ts_ms: Option<u64>,
+    /// Which terminal the hook process was running in, filled in by the bridge from
+    /// its own process ancestry and environment. The agent's payload never says
+    /// "window", so this is the only route back to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<crate::terminal::TerminalContext>,
     /// Anything else the CLI sent, preserved so later phases can read fields
     /// this crate does not know about yet without changing the bridge.
     #[serde(flatten, default)]
@@ -113,7 +145,8 @@ impl HookEvent {
             .as_deref()
             .or(self.event.as_deref())
             .unwrap_or("");
-        crate::event::EventNormalizer::route_kind(name, self.question.is_some())
+        let asks_user = self.tool_name.as_deref() == Some(crate::question::ASK_TOOL);
+        crate::event::EventNormalizer::route_kind(name, self.question.is_some(), asks_user)
     }
 
     /// The one line the island card shows for this event.
@@ -199,6 +232,35 @@ mod tests {
             back.get("some_future_field"),
             Some(&json!({"nested": [1, 2, 3]})),
             "fields we do not model must not be dropped"
+        );
+    }
+
+    #[test]
+    fn an_answer_carries_the_rewritten_input() {
+        // The exact shape the CLI accepted on 2026-10-14, minus the whitespace.
+        let input = serde_json::json!({"answers": {"Red or blue?": "Blue"}, "annotations": {}});
+        let out = permission_answer("PermissionRequest", Behavior::Allow, Some(&input));
+        assert_eq!(
+            out,
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow","updatedInput":{"annotations":{},"answers":{"Red or blue?":"Blue"}}}}}"#
+        );
+        // It must stay parseable, or the CLI silently ignores the decision.
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            parsed["hookSpecificOutput"]["decision"]["updatedInput"]["answers"]["Red or blue?"],
+            "Blue"
+        );
+    }
+
+    #[test]
+    fn a_non_object_input_is_dropped_instead_of_sent() {
+        // Upstream rejects an allow whose updatedInput is not an object; emitting one
+        // would look like a broken bridge, so fall back to the plain envelope.
+        let scalar = serde_json::json!("Blue");
+        let out = permission_answer("PermissionRequest", Behavior::Allow, Some(&scalar));
+        assert_eq!(
+            out,
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
         );
     }
 

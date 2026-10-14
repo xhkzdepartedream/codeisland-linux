@@ -107,8 +107,13 @@ fn run() -> u8 {
         .filter(|q| !q.is_empty())
         .map(str::to_owned);
 
+    // AskUserQuestion rides the permission channel but must not be answered with a
+    // bare approve/deny, so it takes the question route on its way to the daemon.
+    let asks_user = stdin_payload.get("tool_name").and_then(|v| v.as_str())
+        == Some(codeisland_core::question::ASK_TOOL);
+
     let route = match normalized.as_deref() {
-        Some(name) => EventNormalizer::route_kind(name, question.is_some()),
+        Some(name) => EventNormalizer::route_kind(name, question.is_some(), asks_user),
         None => RouteKind::Event,
     };
 
@@ -152,13 +157,24 @@ fn run() -> u8 {
             stdin_payload.get("tool_input"),
         )),
         ts_ms: now_ms(),
-        extra: Default::default(),
+        // Taken from *this* process, not from the payload: the hook runs as a child
+        // of the agent, so its ancestry is the agent's terminal.
+        terminal: Some(codeisland_core::terminal::capture()).filter(|t| t.is_actionable()),
+        // Whatever the CLI sent that we do not model is carried through, so the
+        // journal shows the real payload instead of a projection of it. Until now
+        // this was `Default::default()`, which silently dropped fields like
+        // `message` -- and a dropped `message` is why a "round finished"
+        // notification had nothing to say.
+        extra: collect_extra(&stdin_payload),
     };
 
-    let body = match serde_json::to_vec(&event) {
+    let mut body = match serde_json::to_vec(&event) {
         Ok(body) => body,
         Err(_) => return EXIT_OK,
     };
+    // One frame per connection, terminated by a newline. Compact JSON never
+    // contains a raw newline, so the delimiter cannot appear inside a payload.
+    body.push(b'\n');
 
     let mut stream = match connect(&path) {
         Some(stream) => stream,
@@ -172,8 +188,11 @@ fn run() -> u8 {
         debug_log("write failed, exiting silently");
         return EXIT_OK;
     }
-    // Half-close so the daemon sees EOF and knows the payload is complete.
-    let _ = stream.shutdown(std::net::Shutdown::Write);
+    // The write half deliberately stays open. The daemon reads one newline-
+    // terminated frame, so it no longer needs an EOF to know the payload ended --
+    // and keeping the connection half-open is the only way it can tell a hook that
+    // is still waiting from one whose agent has already exited. Half-closing here
+    // would make every parked card look like a vanished agent.
 
     let wait = match route {
         RouteKind::Permission => PERMISSION_TIMEOUT,
@@ -314,6 +333,58 @@ fn now_ms() -> Option<u64> {
         .map(|d| d.as_millis() as u64)
 }
 
+/// Top-level payload fields that already have a typed home in `HookEvent`.
+const CONSUMED_FIELDS: &[&str] = &[
+    "hook_event_name",
+    "session_id",
+    "cwd",
+    "tool_name",
+    "tool_input",
+    "question",
+    "source",
+];
+
+/// Fields never carried, whatever their size. A PostToolUse `tool_response` can be
+/// megabytes, and the journal is an append-only file on the user's disk; keeping it
+/// would turn a debugging aid into a disk-filling hazard.
+const DROPPED_FIELDS: &[&str] = &["tool_response"];
+
+/// Longest unknown value kept intact.
+const EXTRA_VALUE_CAP: usize = 512;
+
+/// Collect the payload's unmodelled fields, capped so one oversized value cannot
+/// bloat every frame and journal line.
+fn collect_extra(payload: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    let mut extra = serde_json::Map::new();
+    let Some(map) = payload.as_object() else {
+        return extra;
+    };
+    for (key, value) in map {
+        if CONSUMED_FIELDS.contains(&key.as_str()) || DROPPED_FIELDS.contains(&key.as_str()) {
+            continue;
+        }
+        extra.insert(key.clone(), cap_value(value));
+    }
+    extra
+}
+
+fn cap_value(value: &serde_json::Value) -> serde_json::Value {
+    let size = value.to_string().len();
+    if size <= EXTRA_VALUE_CAP {
+        return value.clone();
+    }
+    match value.as_str() {
+        Some(text) => {
+            let mut head: String = text.chars().take(EXTRA_VALUE_CAP).collect();
+            head.push('…');
+            serde_json::Value::String(head)
+        }
+        // Structure is not guessed at: an over-long object or array is replaced by a
+        // marker that says how big it was, which is the honest version of a truncation.
+        None => serde_json::json!({ "truncated_bytes": size }),
+    }
+}
+
 /// Diagnostics go to a file, never stdout -- stdout is a protocol channel.
 fn debug_log(message: &str) {
     if std::env::var_os("CODEISLAND_DEBUG").is_none() {
@@ -327,5 +398,57 @@ fn debug_log(message: &str) {
         .open(path)
     {
         let _ = writeln!(file, "[{}] {message}", now_ms().unwrap_or(0));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unmodelled_fields_survive_the_bridge() {
+        let payload = json!({
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "cwd": "/home/dev/api",
+            "message": "重构完成，测试全绿",
+            "model": "haiku",
+            "stop_hook_active": false
+        });
+        let extra = collect_extra(&payload);
+        assert_eq!(extra["message"], json!("重构完成，测试全绿"));
+        assert_eq!(extra["model"], json!("haiku"));
+        assert_eq!(extra["stop_hook_active"], json!(false));
+        assert!(
+            !extra.contains_key("session_id"),
+            "typed fields must not be duplicated into extra"
+        );
+    }
+
+    #[test]
+    fn a_tool_response_is_never_carried() {
+        let payload = json!({"hook_event_name": "PostToolUse", "tool_response": {"stdout": "x".repeat(5000)}});
+        let extra = collect_extra(&payload);
+        assert!(!extra.contains_key("tool_response"), "the journal must not swallow tool output");
+    }
+
+    #[test]
+    fn long_values_are_capped_not_copybombed() {
+        let payload = json!({"transcript_path": "/tmp/".to_owned() + &"a".repeat(4000)});
+        let extra = collect_extra(&payload);
+        let kept = extra["transcript_path"].as_str().unwrap();
+        assert!(kept.len() <= EXTRA_VALUE_CAP + 12, "kept {} bytes", kept.len());
+        assert!(kept.ends_with('…'), "the truncation is visible: {kept}");
+
+        let big = json!({"meta": {"blob": "y".repeat(4000)}});
+        let extra = collect_extra(&big);
+        assert!(extra["meta"]["truncated_bytes"].is_number(), "structure is reported, not guessed at");
+    }
+
+    #[test]
+    fn a_non_object_payload_produces_no_extra() {
+        assert!(collect_extra(&json!("just a string")).is_empty());
+        assert!(collect_extra(&json!(null)).is_empty());
     }
 }

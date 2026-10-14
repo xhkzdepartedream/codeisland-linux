@@ -108,10 +108,15 @@ impl EventNormalizer {
     /// `has_question` is true when the payload carries a `question` field, which
     /// is how a Notification that is really a question is told apart from an
     /// ordinary notification.
-    pub fn route_kind(event_name: &str, has_question: bool) -> RouteKind {
+    ///
+    /// `asks_user` marks a `PermissionRequest` that is really the agent asking a
+    /// question (`AskUserQuestion`, measured 2026-10-14). It arrives on the
+    /// permission channel but must not be answered with approve/deny: approving it
+    /// without `updatedInput` would run the tool with nobody having answered.
+    pub fn route_kind(event_name: &str, has_question: bool, asks_user: bool) -> RouteKind {
         let normalized = Self::normalize(event_name);
         if normalized == "PermissionRequest" {
-            return RouteKind::Permission;
+            return if asks_user { RouteKind::Question } else { RouteKind::Permission };
         }
         if normalized == "Notification" && has_question {
             return RouteKind::Question;
@@ -151,21 +156,21 @@ mod tests {
     #[test]
     fn permission_request_routes_to_permission() {
         assert_eq!(
-            EventNormalizer::route_kind("PreToolUse", false),
+            EventNormalizer::route_kind("PreToolUse", false, false),
             RouteKind::Event,
             "PreToolUse is a status event on Claude Code, not an approval gate"
         );
         assert_eq!(
-            EventNormalizer::route_kind("PermissionRequest", false),
+            EventNormalizer::route_kind("PermissionRequest", false, false),
             RouteKind::Permission
         );
         assert_eq!(
-            EventNormalizer::route_kind("permission_request", false),
+            EventNormalizer::route_kind("permission_request", false, false),
             RouteKind::Permission,
             "Trae CLI spelling must route identically"
         );
         assert_eq!(
-            EventNormalizer::route_kind("BeforeTool", false),
+            EventNormalizer::route_kind("BeforeTool", false, false),
             RouteKind::Permission,
             "Gemini spelling must route identically"
         );
@@ -174,12 +179,23 @@ mod tests {
     #[test]
     fn notification_is_only_a_question_when_a_question_is_present() {
         assert_eq!(
-            EventNormalizer::route_kind("Notification", false),
+            EventNormalizer::route_kind("Notification", false, false),
             RouteKind::Event
         );
         assert_eq!(
-            EventNormalizer::route_kind("Notification", true),
+            EventNormalizer::route_kind("Notification", true, false),
             RouteKind::Question
         );
     }
 }
+
+    #[test]
+    fn an_ask_user_question_routes_to_the_question_channel() {
+        // Measured: AskUserQuestion arrives as PermissionRequest. Approving it like a
+        // tool call would run the tool with no answer in it, so it must leave the
+        // permission route.
+        assert_eq!(
+            EventNormalizer::route_kind("PermissionRequest", false, true),
+            RouteKind::Question
+        );
+    }

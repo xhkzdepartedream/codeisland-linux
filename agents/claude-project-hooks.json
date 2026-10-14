@@ -1,5 +1,5 @@
 {
-  "_comment": "Shape of the hooks this project installs into a *project-scoped* .claude/settings.json. The bridge is spawned once per event and must always be given --source claude. Automatic installation into the global ~/.claude/settings.json is deliberately NOT implemented yet -- see docs/与上游的差异.md for the known failure mode where Claude Code regenerates that file and drops injected hooks. Replace BRIDGE_PATH with the absolute path to target/release/codeisland-bridge.",
+  "_comment": "Shape of the hooks this project installs into a *project-scoped* .claude/settings.json. The bridge is spawned once per event and must always be given --source claude. Installing these shapes is now automated by `codeisland-hookctl install` (project scope by default). Global ~/.claude/settings.json is opt-in via --scope user, because Claude Code regenerates that file on config changes and drops foreign keys -- run `codeisland-hookctl verify` after any /config edit or upgrade -- see docs/与上游的差异.md for the known failure mode where Claude Code regenerates that file and drops injected hooks. Replace BRIDGE_PATH with the absolute path to target/release/codeisland-bridge.",
 
   "hooks": {
     "SessionStart": [

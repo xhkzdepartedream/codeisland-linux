@@ -14,6 +14,14 @@ RestartSec=2
 # The daemon holds no state that must survive a restart; the hook bridge treats
 # a missing daemon as "let the CLI decide", so a restart is always safe.
 TimeoutStopSec=5
+# The notification watchdog gives up after 3 seconds, which lands inside this 5
+# second stop window -- a wedged `notify-send` cannot hold the session down at
+# shutdown. That failure mode is why the unit has a short timeout at all.
+#
+# Whether a finished round (Stop) also sends a desktop notification. On by default;
+# uncomment to mute it, then `systemctl --user daemon-reload && systemctl --user
+# restart codeisland-daemon`.
+# Environment=CODEISLAND_NOTIFY_ON_STOP=0
 
 [Install]
 WantedBy=graphical-session.target

@@ -5,9 +5,12 @@
 //! rewrite. It mirrors `Sources/CodeIslandCore` in the upstream macOS project.
 
 pub mod event;
+pub mod hooks_install;
 pub mod protocol;
+pub mod question;
 pub mod session;
 pub mod socket_path;
+pub mod terminal;
 
 pub use event::{EventNormalizer, RouteKind};
 pub use session::{Session, SessionRegistry, SessionStatus, ViewUpdate};

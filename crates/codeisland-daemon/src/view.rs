@@ -40,25 +40,54 @@ pub fn view_socket_path() -> PathBuf {
 /// Connected UI clients.
 #[derive(Default)]
 pub struct ViewClients {
+    /// Write half, shared with the broadcaster.
     writers: Vec<(u64, Arc<Mutex<UnixStream>>)>,
+    /// Read half, handed to the per-client reader thread. Kept as a factory
+    /// rather than a moved handle so `reader()` can be asked once per client.
+    readers: Vec<(u64, UnixStream)>,
     next_id: u64,
 }
 
 impl ViewClients {
-    /// Register a client and return its id.
-    pub fn add(&mut self, stream: UnixStream) -> u64 {
+    /// Register a client. Returns `u64::MAX` when no write handle was supplied.
+    pub fn add(&mut self, stream: Option<UnixStream>) -> u64 {
+        let Some(stream) = stream else {
+            return u64::MAX;
+        };
         let id = self.next_id;
         self.next_id += 1;
+        let reader = stream.try_clone().ok();
         self.writers.push((id, Arc::new(Mutex::new(stream))));
+        if let Some(reader) = reader {
+            self.readers.push((id, reader));
+        }
         id
+    }
+
+    /// Take the read half for a client, once.
+    ///
+    /// Handed over rather than cloned so exactly one thread can own it.
+    pub fn reader(&mut self, id: u64) -> Option<UnixStream> {
+        let position = self.readers.iter().position(|(wid, _)| *wid == id)?;
+        Some(self.readers.remove(position).1)
     }
 
     pub fn remove(&mut self, id: u64) {
         self.writers.retain(|(wid, _)| *wid != id);
+        self.readers.retain(|(wid, _)| *wid != id);
     }
 
     pub fn count(&self) -> usize {
         self.writers.len()
+    }
+
+    /// Pick a client to show a card to.
+    ///
+    /// With one island this is the only client. With several, the first is chosen
+    /// deliberately: a permission request must be shown to exactly one of them,
+    /// because two answers for one parked hook is a decision race.
+    pub fn any_viewer(&self) -> Option<u64> {
+        self.writers.first().map(|(id, _)| *id)
     }
 
     /// Send one update to every client, dropping those that have gone away.
@@ -117,7 +146,7 @@ mod tests {
     fn broadcast_reaches_a_connected_client_whole() {
         let (a, b) = UnixStream::pair().unwrap();
         let mut clients = ViewClients::default();
-        clients.add(a);
+        clients.add(Some(a));
 
         let update = ViewUpdate::Snapshot { sessions: vec![] };
         clients.broadcast(&update);
@@ -136,7 +165,7 @@ mod tests {
     fn a_dead_client_is_dropped_not_blocked() {
         let (a, b) = UnixStream::pair().unwrap();
         let mut clients = ViewClients::default();
-        clients.add(a);
+        clients.add(Some(a));
         assert_eq!(clients.count(), 1);
 
         // Reader gone: the first broadcast should fail and evict the entry rather
