@@ -93,6 +93,16 @@ pub struct Session {
     /// existed, and any CLI that omits it, keep behaving as the authoritative case.
     #[serde(default)]
     pub origin: Origin,
+    /// True when `status` is something the harness *stated* rather than something inferred.
+    ///
+    /// A discovered row's status comes from one of two places: the transcript's own turn
+    /// lifecycle record (codex `task_started`/`task_complete`, pi's toolCall-vs-text, claude's
+    /// tool_use-vs-text) -- a statement of fact -- or, when the file states nothing, a fallback
+    /// guess from how recently it was written. Only the second deserves the word "inferred" on
+    /// the card, and this flag is what lets the UI make that distinction instead of labelling
+    /// both alike.
+    #[serde(default)]
+    pub status_stated: bool,
     /// Unix epoch milliseconds of the last event that moved this session.
     pub last_event_ms: u64,
     /// Unix epoch milliseconds when this session appeared.
@@ -263,6 +273,8 @@ impl SessionRegistry {
                 branch: None,
                 detail: None,
                 origin: Origin::Hook,
+                // A hook is the agent stating its own state, so this is never a guess.
+                status_stated: true,
                 last_event_ms: now_ms,
                 started_ms: now_ms,
                 tool_calls: 0,
@@ -354,6 +366,7 @@ impl SessionRegistry {
         detail: Option<String>,
         status: SessionStatus,
         branch: Option<String>,
+        status_stated: bool,
         now_ms: u64,
     ) -> Option<ViewUpdate> {
         if let Some(existing) = self.sessions.get_mut(id) {
@@ -362,10 +375,12 @@ impl SessionRegistry {
             }
             let changed = existing.status != status
                 || existing.detail != detail
-                || existing.branch != branch;
+                || existing.branch != branch
+                || existing.status_stated != status_stated;
             existing.status = status;
             existing.detail = detail.or_else(|| existing.detail.clone());
             existing.branch = branch;
+            existing.status_stated = status_stated;
             existing.last_event_ms = now_ms;
             return changed.then(|| ViewUpdate::SessionUpsert {
                 session: existing.clone(),
@@ -379,6 +394,7 @@ impl SessionRegistry {
             branch,
             detail,
             origin: Origin::Discovered,
+            status_stated,
             last_event_ms: now_ms,
             started_ms: now_ms,
             tool_calls: 0,
@@ -782,6 +798,7 @@ mod permission_wire_tests {
                 Some("存档 · message".into()),
                 SessionStatus::Working,
                 Some("feat/x".into()),
+                true,
                 1_000,
             )
             .expect("a new discovered session must produce an update");
@@ -810,7 +827,7 @@ mod permission_wire_tests {
     #[test]
     fn a_forgotten_discovered_session_leaves_the_ordering_too() {
         let mut reg = SessionRegistry::new();
-        reg.register_discovered("d2", "pi", "/tmp/p", None, SessionStatus::Idle, None, 1_000);
+        reg.register_discovered("d2", "pi", "/tmp/p", None, SessionStatus::Idle, None, true, 1_000);
         let gone = reg.forget_discovered_not_in(&[], 10_000_000);
         assert_eq!(gone.len(), 1);
         let ViewUpdate::Snapshot { sessions } = reg.snapshot() else {
