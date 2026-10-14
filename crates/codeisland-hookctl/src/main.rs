@@ -74,6 +74,18 @@ fn main() {
     let bridge = bridge.unwrap_or_else(default_bridge);
     let path = settings_path(scope, &source);
 
+    if source == "pi" {
+        match command {
+            "install" => pi_install(scope),
+            "verify" => pi_verify(scope),
+            "path" => {
+                println!("{}", settings_path(scope, &source).display());
+                process::exit(0);
+            }
+            _ => usage(),
+        }
+    }
+
     match command {
         "install" => install(&path, &bridge, &source),
         "verify" => verify(&path, &bridge, &source),
@@ -96,7 +108,11 @@ fn usage() -> ! {
          选项：\n\
          \x20 --scope project|user   项目级 ./.<cli>/…（默认）或全局 ~/.​<cli>/…\n\
          \x20 --bridge <路径>        桥接程序绝对路径（默认与本工具同目录）\n\
-         \x20 --source <名字>        传给桥接程序的 --source，默认 claude",
+         \x20 --source <名字>        传给桥接程序的 --source，默认 claude\n\
+         \n\
+         --source pi 走的是另一条路：pi 没有 hook 配置文件，它加载 .pi/extensions/ 下的模块。\n\
+         \x20 所以 install 是把扩展文件放进项目、verify 是逐字节比对；项目级文件受信任门控，\n\
+         \x20 该目录第一次跑 pi 要带 --approve。全局注册请用 pi install，本工具不代写 ~/.pi。",
         hooks_install::HOOK_EVENTS.len(),
         hooks_install::CODEX_EVENTS.len()
     );
@@ -127,9 +143,129 @@ fn default_bridge() -> PathBuf {
 /// user's global CLI config unless asked. codex's project scope is measured, not assumed --
 /// with `$CODEX_HOME/hooks.json` deleted, a lone `<project>/.codex/hooks.json` still
 /// produced all six events at the daemon.
+/// pi does not read a hook file: it loads a module from `.pi/extensions/`. Installing for
+/// pi therefore means placing that module, and verifying means comparing bytes -- not
+/// merging JSON. The directory itself is chosen in `settings_path`, so only the file name
+/// is named twice here and it must stay that way.
+const PI_FILE: &str = "codeisland.ts";
+
+/// Where the shipped extension lives, in the order a user would expect it to be found.
+///
+/// Nothing is baked in at build time: `--bridge` already teaches this tool to prefer
+/// "beside me" over "where the build machine put it", and the same reasoning applies here.
+fn pi_extension_source() -> PathBuf {
+    if let Ok(explicit) = env::var("CODEISLAND_PI_EXTENSION") {
+        return PathBuf::from(explicit);
+    }
+    let exe = env::current_exe().ok();
+    let candidates: Vec<PathBuf> = [
+        exe.as_deref().and_then(|p| p.parent()).map(|d| d.join("pi-extension").join(PI_FILE)),
+        exe.as_deref()
+            .and_then(|p| p.parent())
+            .and_then(|d| d.parent())
+            .and_then(|d| d.parent())
+            .map(|root| root.join("integrations/pi").join(PI_FILE)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for candidate in &candidates {
+        if candidate.exists() {
+            return candidate.clone();
+        }
+    }
+    candidates
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| PathBuf::from(PI_FILE))
+}
+
+fn pi_install(scope: Scope) -> ! {
+    if matches!(scope, Scope::User) {
+        // Global registration is pi's own job, and `pi remove` is the only clean way back
+        // out of it (renaming a directory does nothing: the scanner ignores directory
+        // names). Writing ~/.pi/agent/settings.json by hand would take that path away.
+        fail(
+            "pi 的全局注册不由本工具代写：请运行\n\
+             \x20 pi install <仓库>/integrations/pi\n\
+             \x20 卸载用 pi remove <同一个绝对路径>（相对路径不匹配，必须原样）\n\
+             \x20 项目级则不需要 pi install，直接不带 --scope user 安装到 .pi/extensions/",
+        );
+    }
+
+    let source = pi_extension_source();
+    if !source.exists() {
+        fail(&format!(
+            "找不到要安装的扩展文件：{}\n（用 CODEISLAND_PI_EXTENSION 指定，或先 cargo build --release）",
+            source.display()
+        ));
+    }
+    let body = fs::read_to_string(&source).unwrap_or_else(|err| fail(&format!("读不了扩展文件：{err}")));
+
+    let target = settings_path(scope, "pi");
+    let existed = target.exists();
+    let installed = fs::read_to_string(&target).ok();
+    if hooks_install::extension_state(Some(&body), installed.as_deref()) == hooks_install::ExtensionState::Identical {
+        println!("已是最新：{}（内容与发布版本一致，未改动）", target.display());
+        process::exit(0);
+    }
+
+    if existed {
+        let backup = backup_path(&target, &timestamp_utc());
+        fs::copy(&target, &backup).unwrap_or_else(|err| fail(&format!("备份失败，放弃写入：{err}")));
+        println!("已备份原文件 → {}", backup.display());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).unwrap_or_else(|err| fail(&format!("建不了 {}：{err}", parent.display())));
+    }
+    fs::write(&target, &body).unwrap_or_else(|err| fail(&format!("写不了 {}：{err}", target.display())));
+
+    // Read back from disk, the same rule as the JSON path: what we intended to write is not
+    // evidence that it is there.
+    let raw = fs::read_to_string(&target).unwrap_or_else(|err| fail(&format!("写入后读不回：{err}")));
+    if raw != body {
+        fail("写入后内容与源文件不一致，请检查磁盘");
+    }
+    println!("已安装扩展 → {}", target.display());
+    eprintln!(
+        "两条必须知道的生效条件：\n\
+         \x20 1) 项目级 .pi/extensions/ 受**信任门控**：在该目录第一次跑 pi 要带 --approve（否则文件被忽略，\n\
+         \x20    现象是「装了但一个事件都没有」，实测：不带 --approve 0 事件、带则 SessionStart 起一串）\n\
+         \x20 2) 扩展只在启动时加载，当前会话不会立刻生效\n\
+         \x20 全局注册请改用 pi install <仓库>/integrations/pi，卸载用 pi remove <同一路径>"
+    );
+    process::exit(0);
+}
+
+fn pi_verify(scope: Scope) -> ! {
+    let source = pi_extension_source();
+    let target = settings_path(scope, "pi");
+    let body = fs::read_to_string(&source).ok();
+    let installed = fs::read_to_string(&target).ok();
+    match hooks_install::extension_state(body.as_deref(), installed.as_deref()) {
+        hooks_install::ExtensionState::Identical => {
+            println!("就位：{} 与发布版本一致", target.display());
+            process::exit(0);
+        }
+        hooks_install::ExtensionState::Absent => {
+            eprintln!("缺失：{} 不存在（跑 codeisland-hookctl install --source pi）", target.display());
+            process::exit(1);
+        }
+        hooks_install::ExtensionState::Stale => {
+            eprintln!(
+                "不一致：{} 与 {} 不同（被手改过，或升级后没重装）",
+                target.display(),
+                source.display()
+            );
+            process::exit(1);
+        }
+    }
+}
+
 fn settings_path(scope: Scope, source: &str) -> PathBuf {
     let (dir, file) = match source {
         "codex" => (".codex", "hooks.json"),
+        "pi" => (".pi/extensions", "codeisland.ts"),
         _ => (".claude", "settings.json"),
     };
     match scope {

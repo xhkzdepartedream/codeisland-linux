@@ -62,6 +62,31 @@ systemd 下改法：`systemctl --user edit codeisland-daemon` 加一行
 **胶囊与批准流程完全不受影响**——通知是提醒，能解开 agent 的只有卡片或终端里的回答。
 
 ## 怎么跑
+### pi 的接入方式（与其它 CLI 不同）
+
+pi 没有 hook 配置文件，它的扩展是**加载进 agent 进程的模块**，所以接入形态不一样，三条路按需选：
+
+```bash
+# 1) 一次性、不改任何配置：显式加载
+pi -e integrations/pi/codeisland.ts
+
+# 2) 只装进当前项目（推荐，与 claude/codex 的 --scope project 同纪律）
+codeisland-hookctl install --source pi     # 写到 .pi/extensions/codeisland.ts
+codeisland-hookctl verify  --source pi     # 逐字节比对，被手改或升级后会报不一致
+
+# 3) 全局注册：交给 pi 自己的包管理器，本工具不代写 ~/.pi
+pi install <仓库绝对路径>/integrations/pi
+pi remove  <同一个绝对路径>                # 相对路径不匹配，必须原样
+```
+
+**两条生效条件必须知道，否则会误判成"装了不生效"**：
+
+1. 项目级 `.pi/extensions/` 受**信任门控**：在该目录第一次跑 pi 要带 `--approve`，否则文件被静默忽略。实测：不带 `--approve` 0 事件，带了 `SessionStart` 起一串。
+2. 扩展只在**启动时**加载，当前会话不会立刻生效。
+
+审批语义与 claude/codex 相反：pi 是「处理器不返回就放行」。所以岛不可达时，适配器退回 pi 自己的 `ctx.ui.confirm` 而不是静默放行；只在完全没有界面（`-p`）时才原样继续，因为那时"把决定交回 CLI"就是 CLI 无输入下的本来行为。详见 `docs/协议.md`。
+
+
 
 ```bash
 cargo build --release

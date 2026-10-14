@@ -1,0 +1,12 @@
+{
+  "name": "codeisland-pi",
+  "private": true,
+  "version": "0.1.0",
+  "description": "CodeIsland permission island for Pi: veto tool calls through the island, fall back to Pi's own confirm when it is absent",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./codeisland.ts"
+    ]
+  }
+}

@@ -117,6 +117,31 @@ pub fn parse(raw: &str) -> Result<Value, String> {
     Ok(value)
 }
 
+/// State of the pi extension copy, which is a file rather than a JSON entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionState {
+    /// Nothing installed.
+    Absent,
+    /// Installed copy is byte-identical to the shipped one.
+    Identical,
+    /// Installed copy differs -- edited by someone, or stale after an upgrade.
+    Stale,
+}
+
+/// Compare the shipped extension against the installed copy.
+///
+/// pi is not a JSON-merge CLI: its integration is a module file under
+/// `.pi/extensions/`. So "is the island wired up" here means "is that file the file we
+/// ship", and a hand-edited copy must be reported as drift instead of silently overwritten
+/// or silently trusted.
+pub fn extension_state(source: Option<&str>, installed: Option<&str>) -> ExtensionState {
+    match (source, installed) {
+        (Some(_), None) => ExtensionState::Absent,
+        (Some(a), Some(b)) if a == b => ExtensionState::Identical,
+        (_, _) => ExtensionState::Stale,
+    }
+}
+
 /// Insert or repair our hooks in `settings`, in place.
 pub fn install(settings: &mut Value, bridge: &Path, source: &str) -> InstallReport {
     let mut report = InstallReport::default();
@@ -439,6 +464,21 @@ mod tests {
         let claude_problems = verify(&settings, Path::new("/opt/ci/codeisland-bridge"), "claude");
         assert_eq!(claude_problems.iter().filter(|p| p.starts_with("SessionEnd")).count(), 1,
                    "claude's verifier must still notice a missing SessionEnd in a codex-only file");
+    }
+
+
+    #[test]
+    fn extension_state_tells_absent_from_drift() {
+        assert_eq!(extension_state(Some("x"), None), ExtensionState::Absent);
+        assert_eq!(
+            extension_state(Some("x"), Some("x")),
+            ExtensionState::Identical,
+            "an identical copy must not be reported as drift"
+        );
+        assert_eq!(extension_state(Some("x"), Some("x ")), ExtensionState::Stale);
+        // No shipped file is a packaging error, not a user error: never call it Stale-ok.
+        assert_eq!(extension_state(None, Some("x")), ExtensionState::Stale);
+        assert_eq!(extension_state(None, None), ExtensionState::Stale);
     }
 
 }
