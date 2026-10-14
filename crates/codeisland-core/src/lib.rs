@@ -12,6 +12,7 @@ pub mod question;
 pub mod session;
 pub mod socket_path;
 pub mod terminal;
+pub mod turn;
 
 pub use event::{EventNormalizer, RouteKind};
 pub use session::{Session, SessionRegistry, SessionStatus, ViewUpdate};
