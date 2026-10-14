@@ -25,6 +25,9 @@ struct SessionRow {
     QString origin = QStringLiteral("hook");
     /// Checked-out git branch, read from `.git` by the daemon. Empty when there is no repo.
     QString branch;
+    /// True when the status was stated by the harness (turn record / hook), false when
+    /// the daemon fell back to a freshness guess. Only the latter is an inference.
+    bool status_stated = false;
     int toolCalls = 0;
     qint64 lastEventMs = 0;
     qint64 startedMs = 0;
@@ -50,6 +53,7 @@ public:
         DetailRole,
         OriginRole,
         BranchRole,
+        StatedRole,
         ToolCallsRole,
         LastEventMsRole,
         StartedMsRole,

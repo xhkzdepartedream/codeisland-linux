@@ -618,6 +618,7 @@ delegate: Rectangle {
                     required property string project
                     required property string detail
                     required property string branch
+                    required property bool statusStated
                     required property real lastEventMs
 
                     // The list is capped so a long tail of sessions cannot push the
@@ -757,10 +758,14 @@ delegate: Rectangle {
                             }
                             Text {
                                 Layout.alignment: Qt.AlignRight
-                                // A discovered row is a statement about a file's mtime, not
-                                // about what an agent is waiting for -- say so on the row
-                                // rather than letting an inference look like a report.
-                                text: (origin === "discovered" ? source + " ·推断" : source)
+                                // A discovered row can carry two kinds of status. When the
+                                // transcript states the turn state (codex task_complete, pi
+                                // toolCall-vs-text, claude tool_use-vs-text) the status is a
+                                // fact and reads like a hook's -- no hedge. When it came from
+                                // the freshness fallback, the row says "推断" so a guess never
+                                // looks like a report.
+                                text: (origin === "discovered" && !statusStated
+                                       ? source + " ·推断" : source)
                                       + " · " + island.humanize(island.nowMs - lastEventMs)
                                 color: "#636366"
                                 font.pixelSize: 11
