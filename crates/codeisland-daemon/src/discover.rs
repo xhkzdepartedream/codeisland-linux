@@ -166,17 +166,27 @@ pub fn transcript_cwd(path: &Path) -> Option<String> {
 /// a later hook event converge on one session instead of opening two:
 ///   claude  `<uuid>.jsonl`
 ///   pi      `<timestamp>_<uuid>.jsonl` -- the exact string the pi extension reports
-///   codex   `rollout-<date>T<hh-mm-ss>-<uuid>.jsonl` -- the uuid is what hooks report
+///   codex   `rollout-<timestamp>-<thread-uuid>[_<second-uuid>].jsonl`
+///
+/// Codex needs care. Its name has two shapes and, in the second, two uuids separated by `_`,
+/// so splitting on `-` and taking the last five groups produced garbage -- it merged the tail
+/// of one uuid into another (`...a86d0b4150b9_01a13a62-...`). The timestamp prefix is fixed
+/// width (`YYYY-MM-DDThh-mm-ss`), and the transcript's own `session_meta` record names the
+/// first uuid as `session_id`, so: cut the prefix, then take everything before the first `_`.
 pub fn session_id_of(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_string_lossy().to_string();
     let stem = name.strip_suffix(".jsonl").unwrap_or(&name);
-    let Some(rest) = stem.strip_prefix("rollout-") else {
+    const PREFIX: &str = "rollout-";
+    let Some(rest) = stem.strip_prefix(PREFIX) else {
         return Some(stem.to_string());
     };
-    // A uuid is the last five dash-separated groups; everything before it is the timestamp.
-    let groups: Vec<&str> = rest.split('-').collect();
+    // Two shapes: `rollout-<stamp>-<uuid>` and `rollout-<stamp>-<uuid>_<other-uuid>`. Drop the
+    // `_` suffix first -- otherwise its dashed tail merges into the uuid -- and then the uuid
+    // is simply the last five dash groups, whatever the stamp looked like.
+    let head = rest.split('_').next().unwrap_or(rest);
+    let groups: Vec<&str> = head.split('-').collect();
     if groups.len() < 5 {
-        return Some(rest.to_string());
+        return Some(head.to_string());
     }
     Some(groups[groups.len() - 5..].join("-"))
 }
@@ -283,11 +293,29 @@ fn candidates(root: &Path, limit: usize) -> Vec<PathBuf> {
     files.into_iter().map(|(_modified, path)| path).collect()
 }
 
-/// Match live agent processes to their transcripts.
+/// Match live agent processes to their transcripts, and pick up sessions whose process is not
+/// recognisable at all.
 ///
-/// `max_age_ms` bounds how old a transcript may be and still count as "this process's
-/// session": a process whose newest archive is three weeks old is a different thing from a
-/// session that is running now.
+/// The old version required `process.cwd == transcript_cwd` and nothing else. That key is
+/// simply wrong for real harnesses, and this machine proved it: pi\'s process sits in `$HOME`
+/// while its transcript records the project directory, because pi chdirs to the home directory
+/// at start-up. Matching on cwd equal to the transcript left pi sessions permanently
+/// undiscovered -- including the one being typed into at the time.
+///
+/// Two facts replace it:
+///
+/// 1. **A harness owns its newest transcripts.** A harness's transcript directory *is* that
+///    harness, so the newest few files in it are that harness's live sessions. How many
+///    "few" is the number of live processes of that harness plus one, so several sessions
+///    running in parallel are all covered without walking a whole archive of years.
+/// 2. **A live process confirms a session, and a fresh writer needs no confirmation.** When a
+///    live process of the harness can be tied to a transcript (the same directory, or a shell
+///    the agent is running a command in) we carry its pid, which is what terminal jump needs.
+///    When none can, a transcript written seconds ago is still unmistakably live -- that is
+///    the pi case above, and dropping it is exactly the complaint this code exists to fix.
+///
+/// `max_age_ms` is therefore the window that decides "still there": it bounds both which
+/// transcripts are considered and how recently a process-less one must have been written.
 pub fn discover(
     now_ms: u64,
     max_age_ms: u64,
@@ -316,29 +344,44 @@ pub fn discover_in(
     probe_limit: usize,
     cwd_cache: &mut std::collections::HashMap<PathBuf, (u64, Option<String>)>,
 ) -> Vec<Discovered> {
-    if processes.is_empty() {
-        return Vec::new();
-    }
     let roots = archive_roots(home);
     let mut out: Vec<Discovered> = Vec::new();
     let mut claimed: Vec<PathBuf> = Vec::new();
 
-    for process in processes {
-        let Some(root) = roots.get(&process.harness) else {
+    for (harness, root) in &roots {
+        let live = processes
+            .iter()
+            .filter(|process| process.harness == *harness)
+            .count();
+        // No process of this harness is running, so nothing here is live. Discovery is for
+        // sessions a hook cannot see; a session with no process and no hook is simply over.
+        if live == 0 {
             continue;
-        };
-        for path in candidates(root, probe_limit) {
+        }
+        // The newest `probe_limit` transcripts. `probe_limit` bounds a directory walk to a few
+        // stats; how many rows come out is bounded separately, by evidence (an open descriptor
+        // or a seated process) and by the per-harness live-process count. It is deliberately
+        // not `live`, because one daemon can hold several transcripts -- the codex app-server
+        // holds every open thread -- and capping the walk at the process count would hide all
+        // but one of them.
+        let take = probe_limit;
+
+        // Parse once: the cwd and id are needed by both passes, and the file walk is the
+        // expensive part.
+        struct Entry {
+            path: PathBuf,
+            cwd: String,
+            session_id: String,
+            last_write_ms: u64,
+        }
+        let mut entries: Vec<Entry> = Vec::new();
+        for path in candidates(root, take) {
             if claimed.contains(&path) {
                 continue;
             }
             let Ok(meta) = path.metadata() else {
                 continue;
             };
-            let last_write_ms = millis_of(&meta);
-            if last_write_ms.saturating_add(max_age_ms) < now_ms {
-                // Sorted newest first, so nothing further back is live either.
-                break;
-            }
             // The cwd of a transcript never changes once written, so cache on size: a file
             // nobody is rewriting is parsed once ever, not once per scan.
             let size = meta.len();
@@ -350,28 +393,200 @@ pub fn discover_in(
                     found
                 }
             };
-            let Some(cwd) = cwd else {
+            let (Some(cwd), Some(session_id)) = (cwd, session_id_of(&path)) else {
                 continue;
             };
-            if Path::new(&cwd) != process.cwd.as_path() {
+            entries.push(Entry {
+                path,
+                cwd,
+                session_id,
+                last_write_ms: millis_of(&meta),
+            });
+        }
+
+        // Pass one: bind transcripts to live processes by evidence, strongest first.
+        //
+        //  1. A file the process holds open that names the session: the transcript itself, or
+        //     codex's `<uuid>.lock`. This is the harness saying "this conversation is mine,
+        //     right now", and it is the only signal that survives a shared daemon -- the codex
+        //     app-server holds the rollouts and locks of *every* thread it serves, so one pid
+        //     can legitimately own several sessions. Measured here: pid 337767 held two
+        //     rollouts and two writer locks at once.
+        //  2. A process sitting in the transcript's directory (or a shell spawned there). This
+        //     one is one-to-one: a process is in one directory.
+        //
+        // Taken before the freshness pass, so a newer unclaimed transcript cannot push a
+        // proven one out and steal its pid.
+        let mut rows: Vec<(usize, u32)> = Vec::new();
+        let mut held: Vec<(String, PathBuf, u32)> = Vec::new();
+        for process in &processes {
+            if process.harness == *harness {
+                for (id, path) in held_session_files(process.pid) {
+                    held.push((id, realpath(&path), process.pid));
+                }
+            }
+        }
+        let mut cwd_used: Vec<u32> = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            // Identity by session id, not by path: the same session may be held as a transcript
+            // by one process and as a `.lock` by another, and both mean the same session.
+            let wanted = realpath(&entry.path);
+            let mut owners: Vec<u32> = held
+                .iter()
+                .filter(|(id, path, _)| {
+                    *id == entry.session_id || *path == wanted
+                })
+                .map(|(_, _, pid)| *pid)
+                .collect();
+            owners.sort_unstable();
+            owners.dedup();
+            if let Some(pid) = owners.first() {
+                rows.push((index, *pid));
                 continue;
             }
-            let Some(session_id) = session_id_of(&path) else {
+            // The cwd rule is the weakest of the three, because a process sitting in a directory
+            // proves far less than an open file does: every codex process on this machine sits in
+            // $HOME, and a long-finished thread whose transcript recorded $HOME matches on
+            // directory alone -- measured here, a 4-hour-old thread was bound this way and shown
+            // as running. So a cwd match is trusted without regard to age only for the harness's
+            // newest transcript (a parked agent whose transcript nothing has superseded -- the
+            // realistic long-quiet case); an older one must be recent to count.
+            let is_newest = index == 0;
+            if !is_newest && entry.last_write_ms.saturating_add(max_age_ms) < now_ms {
                 continue;
-            };
-            claimed.push(path.clone());
+            }
+            if let Some(pid) = processes
+                .iter()
+                .find(|process| {
+                    process.harness == *harness
+                        && !cwd_used.contains(&process.pid)
+                        && process_owns_cwd(process.pid, &process.cwd, &entry.cwd)
+                })
+                .map(|process| process.pid)
+            {
+                cwd_used.push(pid);
+                rows.push((index, pid));
+            }
+        }
+
+        // Pass two: a running agent owns the freshest archives of its own harness even when no
+        // process here admits to their directories. Pi does exactly this on this machine -- it
+        // chdirs to $HOME, so its process cwd never equals its transcript cwd, and before this
+        // pass a pi session being typed into was invisible. Fill up to one row per live process,
+        // and only with a transcript recent enough that no process is needed to believe it: an
+        // agent that has just started has not written yet, and without the age bound this would
+        // resurrect that harness's previous session instead.
+        for (index, entry) in entries.iter().enumerate() {
+            if rows.len() >= live {
+                break;
+            }
+            if rows.iter().any(|(taken, _)| *taken == index) {
+                continue;
+            }
+            if entry.last_write_ms.saturating_add(max_age_ms) < now_ms {
+                continue;
+            }
+            rows.push((index, 0));
+        }
+
+        for (index, pid) in rows {
+            let entry = &entries[index];
+            claimed.push(entry.path.clone());
             out.push(Discovered {
-                harness: process.harness,
-                session_id,
-                cwd,
-                transcript: path,
-                last_write_ms,
-                pid: Some(process.pid),
+                harness: *harness,
+                session_id: entry.session_id.clone(),
+                cwd: entry.cwd.clone(),
+                transcript: entry.path.clone(),
+                last_write_ms: entry.last_write_ms,
+                pid: (pid != 0).then_some(pid),
             });
-            break;
+        }
+    }
+
+    // Newest first, so the island lists the sessions actually doing something on top.
+    out.sort_by(|a, b| b.last_write_ms.cmp(&a.last_write_ms));
+    out
+}
+
+/// Files a process currently holds open that name a session, as `(session_id, path)`.
+///
+/// Two shapes, both measured on this machine:
+///
+/// - A transcript held open directly. The codex app-server keeps the rollouts of the threads
+///   it serves open, and an agent mid-append may hold its own.
+/// - A lock file whose *name* is the session id. Codex writes
+///   `~/.codex/thread-writer-locks/<uuid>.lock` while a thread is live and removes it after,
+///   which is a far better answer than "its mtime is recent" -- it is the harness saying which
+///   threads exist right now. Matching on the file name keeps this independent of codex's
+///   private directory layout: any file named `<id>.lock` is a claim about `<id>`.
+///
+/// A read error is treated as "holds nothing": the process may have exited between listing
+/// and reading, and a failed scan must never manufacture a live session.
+fn held_session_files(pid: u32) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(fds) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return out;
+    };
+    for fd in fds.flatten() {
+        let Ok(target) = fs::read_link(fd.path()) else {
+            continue;
+        };
+        let Some(name) = target.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if target.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if let Some(id) = session_id_of(&target) {
+                out.push((id, target));
+            }
+        } else if let Some(id) = name.strip_suffix(".lock") {
+            // Only uuid-shaped locks: codex keeps unrelated locks (`state`, `.lock`) in the
+            // same tree, and matching those would invent sessions that do not exist.
+            if id.len() == 36 && id.split('-').count() == 5 {
+                out.push((id.to_string(), target));
+            }
         }
     }
     out
+}
+
+/// Is this process sitting in `cwd`, or is the agent running a command there?
+///
+/// The second half matters for harnesses that run Bash tool calls: the shell they spawn
+/// inherits the session directory, while the agent's own cwd may be anywhere. Walking the
+/// parent chain a short way finds that shell. Bounded, and only ever used to attach a pid --
+/// never to decide whether a session exists.
+fn process_owns_cwd(pid: u32, own_cwd: &Path, cwd: &str) -> bool {
+    let target = realpath(Path::new(cwd));
+    if realpath(own_cwd) == target {
+        return true;
+    }
+    let mut current = pid;
+    for _ in 0..6 {
+        let Some(parent) = parent_of(current) else {
+            return false;
+        };
+        let Ok(parent_cwd) = fs::read_link(format!("/proc/{parent}/cwd")) else {
+            return false;
+        };
+        if realpath(&parent_cwd) == target {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// Parent pid from `/proc/<pid>/stat`, whose fields are shifted by the comm column.
+fn parent_of(pid: u32) -> Option<u32> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    // After the closing paren the next field is the state, so the parent is the second one.
+    fields.get(1)?.parse::<u32>().ok()
+}
+
+fn realpath(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Has this transcript moved recently? That is the whole of what discovery may claim about
@@ -517,6 +732,48 @@ mod tests {
     }
 
     #[test]
+    fn a_session_whose_process_sits_elsewhere_is_still_found() {
+        // The bug this guards, measured on this machine: pi chdirs to $HOME, so its process cwd
+        // is never the project directory its transcript records. Requiring cwd equality meant
+        // the session being typed into at that moment was invisible -- the whole complaint.
+        // One live pi process, one transcript written seconds ago in an unrelated directory,
+        // and the session must still appear (with no pid, since none can be proven).
+        let root = std::env::temp_dir().join(format!("ci-discover-pi-{}", now_ms()));
+        let transcript = fixture(
+            &root,
+            Harness::Pi,
+            "/home/u/pi-sessions/agent universe",
+            "2026-10-13T06-24-42-279Z_01a133ef",
+            r#"{"type":"message"}"#,
+        );
+        let processes = vec![AgentProcess {
+            harness: Harness::Pi,
+            pid: 369446,
+            cwd: PathBuf::from("/home/u"),
+        }];
+        let home = root.clone();
+        let mut cache = std::collections::HashMap::new();
+        let found = discover_in(&home, processes, now_ms(), 600_000, 50, &mut cache);
+        assert_eq!(found.len(), 1, "the running session must be visible: {found:?}");
+        assert_eq!(found[0].transcript, transcript);
+        assert_eq!(found[0].cwd, "/home/u/pi-sessions/agent universe");
+        assert_eq!(found[0].pid, None, "no process is in that directory, so no pid is claimed");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_harness_with_no_running_process_reports_nothing() {
+        // A transcript with no hook and no process is an archive, not a session. Without this
+        // bound the island would list every recent conversation as if it were running.
+        let root = std::env::temp_dir().join(format!("ci-discover-idle-{}", now_ms()));
+        fixture(&root, Harness::Pi, "/tmp/proj", "fresh", "{}");
+        let mut cache = std::collections::HashMap::new();
+        let found = discover_in(&root, Vec::new(), now_ms(), 600_000, 50, &mut cache);
+        assert!(found.is_empty(), "no process means no session: {found:?}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn stale_transcripts_are_not_reported_as_live_sessions() {
         let root = std::env::temp_dir().join(format!("ci-discover-old-{}", now_ms()));
         fixture(&root, Harness::Claude, "/tmp/proj", "uuid-1", "{}");
@@ -524,10 +781,12 @@ mod tests {
         // hour-old file stale by definition, and keeps the test free of libc FFI.
         let an_hour_later = now_ms() + 3_600_000;
 
+        // A running process in some *other* directory: it cannot claim this transcript by
+        // cwd, so only the freshness pass could pick it up, and the age bound must refuse.
         let processes = vec![AgentProcess {
             harness: Harness::Claude,
             pid: 1,
-            cwd: PathBuf::from("/tmp/proj"),
+            cwd: PathBuf::from("/tmp/elsewhere"),
         }];
         let mut cache = std::collections::HashMap::new();
         let found = discover_in(&root, processes, an_hour_later, 60_000, 50, &mut cache);
@@ -536,11 +795,95 @@ mod tests {
     }
 
     #[test]
+    fn a_quiet_session_with_a_live_process_is_a_session_not_an_archive() {
+        // The other side of the age bound: an agent parked at a prompt for an hour has not
+        // written anything, but its process is still sitting in the session directory. That is
+        // a live idle session, and discovery must say so instead of letting it vanish.
+        let root = std::env::temp_dir().join(format!("ci-discover-quiet-{}", now_ms()));
+        fixture(&root, Harness::Claude, "/tmp/proj", "uuid-quiet", "{}");
+        let processes = vec![AgentProcess {
+            harness: Harness::Claude,
+            pid: 1,
+            cwd: PathBuf::from("/tmp/proj"),
+        }];
+        let an_hour_later = now_ms() + 3_600_000;
+        let mut cache = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, an_hour_later, 60_000, 50, &mut cache);
+        assert_eq!(found.len(), 1, "a quiet session with a live process is still a session");
+        assert_eq!(found[0].pid, Some(1));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_held_transcript_binds_a_process_that_shares_no_directory() {
+        // The codex shape: an app-server daemon holds the rollouts of every thread it serves,
+        // and its own cwd is $HOME. Directory matching cannot see that, but the open descriptor
+        // says it outright -- so it is checked first. This test holds the file open itself,
+        // which is the only way to assert on real /proc state without a live codex.
+        let dir = std::env::temp_dir().join(format!("ci-discover-fd-{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout-2026-10-14T20-28-07-01a139b5-e5a5-77b0-a481-a86d0b4150b9.jsonl");
+        fs::write(&path, "{\"cwd\":\"/tmp/elsewhere\"}\n").unwrap();
+        let held = fs::File::open(&path).unwrap();
+        let me = std::process::id();
+
+        let names: Vec<String> = held_session_files(me).into_iter().map(|(id, _)| id).collect();
+        assert!(
+            names.iter().any(|id| id == "01a139b5-e5a5-77b0-a481-a86d0b4150b9"),
+            "a held transcript must name its session: {names:?}"
+        );
+        drop(held);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_writer_lock_names_a_live_session_and_a_random_lock_does_not() {
+        // Codex declares a live thread with `thread-writer-locks/<uuid>.lock`. The id is in the
+        // *file name*, so this works without knowing codex's directory layout -- which is the
+        // point, since that layout is private and can change. Unrelated locks in the same tree
+        // (`state`, `.lock`) must not be read as sessions, or discovery invents threads.
+        let dir = std::env::temp_dir().join(format!("ci-discover-lock-{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        let uuid = "01a139b5-e5a5-77b0-a481-a86d0b4150b9";
+        let lock = dir.join(format!("{uuid}.lock"));
+        fs::write(&lock, "").unwrap();
+        let decoy = dir.join("state.lock");
+        fs::write(&decoy, "").unwrap();
+        let held_lock = fs::File::open(&lock).unwrap();
+        let held_decoy = fs::File::open(&decoy).unwrap();
+        let me = std::process::id();
+
+        let found = held_session_files(me);
+        assert!(
+            found.iter().any(|(id, _)| id == uuid),
+            "a uuid-named writer lock must be reported: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|(id, _)| id == "state"),
+            "an unrelated lock must never become a session: {found:?}"
+        );
+        drop(held_lock);
+        drop(held_decoy);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn codex_rollout_names_yield_the_thread_uuid_that_hooks_report() {
         let path = Path::new("rollout-2026-10-14T17-19-44-01a139b5-e5a5-77b0-a481-a86d0b4150b9.jsonl");
         assert_eq!(
             session_id_of(path).as_deref(),
             Some("01a139b5-e5a5-77b0-a481-a86d0b4150b9")
+        );
+        // The second shape, measured on this machine: two uuids joined by `_`. The old
+        // dash-splitting rule returned `a86d0b4150b9_01a13a62-5eaf-7160-93f6-471ee359a365`,
+        // which matches nothing a hook ever reports.
+        let resumed = Path::new(
+            "rollout-2026-10-14T20-28-07-01a139b5-e5a5-77b0-a481-a86d0b4150b9_01a13a62-5eaf-7160-93f6-471ee359a365.jsonl",
+        );
+        assert_eq!(
+            session_id_of(resumed).as_deref(),
+            Some("01a139b5-e5a5-77b0-a481-a86d0b4150b9"),
+            "the first uuid is the one the transcript's own session_meta names as session_id"
         );
     }
 
