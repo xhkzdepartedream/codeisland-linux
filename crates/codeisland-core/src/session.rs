@@ -353,15 +353,19 @@ impl SessionRegistry {
         cwd: &str,
         detail: Option<String>,
         status: SessionStatus,
+        branch: Option<String>,
         now_ms: u64,
     ) -> Option<ViewUpdate> {
         if let Some(existing) = self.sessions.get_mut(id) {
             if existing.origin != Origin::Discovered {
                 return None; // hooks know better than we do
             }
-            let changed = existing.status != status || existing.detail != detail;
+            let changed = existing.status != status
+                || existing.detail != detail
+                || existing.branch != branch;
             existing.status = status;
             existing.detail = detail.or_else(|| existing.detail.clone());
+            existing.branch = branch;
             existing.last_event_ms = now_ms;
             return changed.then(|| ViewUpdate::SessionUpsert {
                 session: existing.clone(),
@@ -372,7 +376,7 @@ impl SessionRegistry {
             source: source.to_string(),
             status,
             cwd: Some(cwd.to_string()),
-            branch: None,
+            branch,
             detail,
             origin: Origin::Discovered,
             last_event_ms: now_ms,
@@ -777,6 +781,7 @@ mod permission_wire_tests {
                 "/tmp/proj",
                 Some("存档 · message".into()),
                 SessionStatus::Working,
+                Some("feat/x".into()),
                 1_000,
             )
             .expect("a new discovered session must produce an update");
@@ -805,7 +810,7 @@ mod permission_wire_tests {
     #[test]
     fn a_forgotten_discovered_session_leaves_the_ordering_too() {
         let mut reg = SessionRegistry::new();
-        reg.register_discovered("d2", "pi", "/tmp/p", None, SessionStatus::Idle, 1_000);
+        reg.register_discovered("d2", "pi", "/tmp/p", None, SessionStatus::Idle, None, 1_000);
         let gone = reg.forget_discovered_not_in(&[], 10_000_000);
         assert_eq!(gone.len(), 1);
         let ViewUpdate::Snapshot { sessions } = reg.snapshot() else {

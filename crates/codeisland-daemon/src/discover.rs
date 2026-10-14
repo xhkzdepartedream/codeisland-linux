@@ -94,6 +94,10 @@ pub struct Discovered {
     pub session_id: String,
     pub cwd: String,
     pub transcript: PathBuf,
+    /// The checked-out git branch in `cwd`, when it could be read from disk. Kept on the row
+    /// because a session's branch is the second-most useful thing about it after the project,
+    /// and because a card that shows it costs one small file read per directory.
+    pub branch: Option<String>,
     /// Milliseconds since the epoch of the last write to the transcript.
     pub last_write_ms: u64,
     /// The process we matched it to, when one is running.
@@ -497,6 +501,7 @@ pub fn discover_in(
                 session_id: entry.session_id.clone(),
                 cwd: entry.cwd.clone(),
                 transcript: entry.path.clone(),
+                branch: codeisland_core::git::head_branch(std::path::Path::new(&entry.cwd)),
                 last_write_ms: entry.last_write_ms,
                 pid: (pid != 0).then_some(pid),
             });

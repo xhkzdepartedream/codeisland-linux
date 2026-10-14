@@ -1079,6 +1079,7 @@ fn scan_once(
             &item.cwd,
             detail,
             status,
+            item.branch.clone(),
             now,
         ) {
             updates.push(update);

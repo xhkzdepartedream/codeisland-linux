@@ -5,6 +5,7 @@
 //! rewrite. It mirrors `Sources/CodeIslandCore` in the upstream macOS project.
 
 pub mod event;
+pub mod git;
 pub mod hooks_install;
 pub mod protocol;
 pub mod question;
