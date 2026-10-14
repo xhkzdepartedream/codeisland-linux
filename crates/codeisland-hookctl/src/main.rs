@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
-use codeisland_core::hooks_install::{self, HOOK_EVENTS};
+use codeisland_core::hooks_install;
 
 /// Where the hooks go.
 ///
@@ -72,7 +72,7 @@ fn main() {
     }
 
     let bridge = bridge.unwrap_or_else(default_bridge);
-    let path = settings_path(scope);
+    let path = settings_path(scope, &source);
 
     match command {
         "install" => install(&path, &bridge, &source),
@@ -86,15 +86,19 @@ fn usage() -> ! {
     eprintln!(
         "用法: codeisland-hookctl <install|verify|path> [选项]\n\
          \n\
-         \x20 install   把本项目的 {} 个 hook 写进 settings.json（只补自己的，不碰别人的）\n\
+         \x20 install   把本项目需要的 hook 写进配置文件（claude {} 个 / codex {} 个；只补自己的，不碰别人的）\n\
          \x20 verify    检查 hook 是否还在、是否还指向当前桥接程序；有问题退出码 1\n\
-         \x20 path      打印将要读写的 settings.json 路径\n\
+         \x20 path      打印将要读写的配置文件路径\n\
+         \n\
+         配置文件随 --source 变：claude 用 .claude/settings.json，codex 用 .codex/hooks.json。\n\
+         两者都有项目级，默认只动项目级；codex 另有一道信任门，install 会把操作步骤打出来。\n\
          \n\
          选项：\n\
-         \x20 --scope project|user   项目级 ./.claude/settings.json（默认）或全局 ~/.claude/settings.json\n\
+         \x20 --scope project|user   项目级 ./.<cli>/…（默认）或全局 ~/.​<cli>/…\n\
          \x20 --bridge <路径>        桥接程序绝对路径（默认与本工具同目录）\n\
          \x20 --source <名字>        传给桥接程序的 --source，默认 claude",
-        HOOK_EVENTS.len()
+        hooks_install::HOOK_EVENTS.len(),
+        hooks_install::CODEX_EVENTS.len()
     );
     process::exit(2)
 }
@@ -117,14 +121,66 @@ fn default_bridge() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("codeisland-bridge"))
 }
 
-fn settings_path(scope: Scope) -> PathBuf {
+/// Where the CLI actually reads its hooks from, per source and per scope.
+///
+/// Project scope exists for both CLIs, which is the point: this tool does not touch a
+/// user's global CLI config unless asked. codex's project scope is measured, not assumed --
+/// with `$CODEX_HOME/hooks.json` deleted, a lone `<project>/.codex/hooks.json` still
+/// produced all six events at the daemon.
+fn settings_path(scope: Scope, source: &str) -> PathBuf {
+    let (dir, file) = match source {
+        "codex" => (".codex", "hooks.json"),
+        _ => (".claude", "settings.json"),
+    };
     match scope {
-        Scope::Project => env::current_dir().unwrap_or_else(|_| PathBuf::from(".")).join(".claude").join("settings.json"),
+        Scope::Project => env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(dir)
+            .join(file),
         Scope::User => {
-            let home = env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| fail("需要 HOME 才能定位 ~/.claude"));
-            home.join(".claude").join("settings.json")
+            let home = env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| fail("需要 HOME 才能定位 ~/.claude 或 ~/.codex"));
+            home.join(dir).join(file)
         }
     }
+}
+
+/// `<原名>.bak-<utc>`, beside the original and keeping the original's name.
+///
+/// The backup name used to be hardcoded to `settings.json.bak-*`, which for codex wrote a
+/// file called settings.json into `.codex/` -- a stray file with a misleading name in the
+/// directory we are about to be told to trust.
+fn backup_path(path: &PathBuf, stamp: &str) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "hooks.json".to_string());
+    path.with_file_name(format!("{name}.bak-{stamp}"))
+}
+
+/// codex gates hooks on a per-command trust hash that no CLI flag writes on the user's
+/// behalf. Silence about it would look like a broken install.
+fn trust_note(source: &str, existed_before: bool) {
+    if source != "codex" {
+        return;
+    }
+    let verb = if existed_before {
+        "本次是往已有配置里写；只要 command 字符串变过，trusted_hash 就失效，提示会重新出现"
+    } else {
+        "第一次安装，必然要过一次信任门"
+    };
+    eprintln!(
+        "codex 还有一道信任门（{verb}）：\n\
+         \x20 1) 在该项目里运行 codex，会弹「Hooks need review」\n\
+         \x20 2) 默认光标停在「1. Review hooks」，必须先按 ↓ 再回车，选「2. Trust all and continue」\n\
+         \x20 3) 此后信任记在 ~/.codex/config.toml 的 [hooks.state.\"<文件>:<事件>:0:0\"] trusted_hash，不再提示\n\
+         \x20 未信任之前，codex 不会执行这些 hook，本工具的 verify 也看不出差别——它只检查配置在不在。\n\
+         \n\
+         \x20 还有一道更早的门：第一次进入某个项目目录，codex 会问是否信任该文件夹。\n\
+         \x20 那一句没答完，会话根本不建立，hook 一个事件都不会发。同一份配置实测：\n\
+         \x20 已信任目录 5 个事件、新目录 0 个事件——所以别把这两件事混成一个 bug。"
+    );
 }
 
 fn install(path: &PathBuf, bridge: &PathBuf, source: &str) -> ! {
@@ -156,12 +212,13 @@ fn install(path: &PathBuf, bridge: &PathBuf, source: &str) -> ! {
             eprintln!("注意：这些条目形状不认识，已原样跳过：{}", report.skipped.join(", "));
         }
         // Still verify: "no changes" and "correct" are different claims.
+        trust_note(source, false);
         process::exit(finish_verify(path, bridge, source, true));
     }
 
     // Dated backup before the first write, and only before a real change.
     if existed {
-        let backup = path.with_file_name(format!("settings.json.bak-{}", timestamp_utc()));
+        let backup = backup_path(path, &timestamp_utc());
         if let Err(err) = fs::copy(path, &backup) {
             fail(&format!("备份失败，放弃写入：{err}"));
         }
@@ -185,6 +242,7 @@ fn install(path: &PathBuf, bridge: &PathBuf, source: &str) -> ! {
         eprintln!("注意：这些条目形状不认识，已原样跳过：{}", report.skipped.join(", "));
     }
 
+    trust_note(source, existed);
     process::exit(finish_verify(path, bridge, source, false));
 }
 
@@ -208,7 +266,13 @@ fn finish_verify(path: &PathBuf, bridge: &PathBuf, source: &str, quiet_ok: bool)
     match verify_against(&settings, bridge, source) {
         0 => {
             if !quiet_ok {
-                println!("复查通过：{} 个 hook 都在，且指向 {}", HOOK_EVENTS.len(), bridge.display());
+                // 数字必须来自本次 source 的事件表。这里曾经硬编码 claude 的 7，于是给 codex 报了一句
+                // "7 个 hook 都在"而文件里只有 6 个 —— 校验器报一个和磁盘不符的数，比不报更坏。
+                println!(
+                    "复查通过：{} 个 hook 都在，且指向 {}",
+                    hooks_install::events_for(source).len(),
+                    bridge.display()
+                );
             }
             0
         }

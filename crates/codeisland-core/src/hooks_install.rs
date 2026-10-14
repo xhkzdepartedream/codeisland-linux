@@ -31,6 +31,31 @@ pub const HOOK_EVENTS: [&str; 7] = [
     "SessionEnd",
 ];
 
+/// Events codex dispatches, measured on codex-cli 0.162.1: a project-scoped
+/// `.codex/hooks.json` holding these six produced six daemon-visible events, and
+/// `SessionEnd` was never among them.
+///
+/// This is deliberately *not* claude's list. Installing a hook for an event the CLI does
+/// not dispatch looks harmless -- `verify` would report it healthy -- but it is a lie that
+/// silently ages into "the island stopped working" the first time someone reads the config.
+pub const CODEX_EVENTS: [&str; 6] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "PermissionRequest",
+    "Stop",
+];
+
+/// The event vocabulary belongs to the CLI, and `--source` already names the CLI, so a
+/// caller never chooses twice.
+pub fn events_for(source: &str) -> &'static [&'static str] {
+    match source {
+        "codex" => &CODEX_EVENTS,
+        _ => &HOOK_EVENTS,
+    }
+}
+
 /// Per-event hook timeout, in seconds.
 ///
 /// `PermissionRequest` is the outlier on purpose: the bridge blocks on the socket
@@ -96,11 +121,12 @@ pub fn parse(raw: &str) -> Result<Value, String> {
 pub fn install(settings: &mut Value, bridge: &Path, source: &str) -> InstallReport {
     let mut report = InstallReport::default();
     let command = command_for(bridge, source);
+    let events = events_for(source);
 
     let root = match settings.as_object_mut() {
         Some(root) => root,
         None => {
-            report.skipped = HOOK_EVENTS.iter().map(|e| (*e).to_string()).collect();
+            report.skipped = events.iter().map(|e| (*e).to_string()).collect();
             return report;
         }
     };
@@ -113,12 +139,12 @@ pub fn install(settings: &mut Value, bridge: &Path, source: &str) -> InstallRepo
         // `hooks` exists but is not an object (a string, an array, ...). That is
         // the user's data, not ours to reshape.
         None => {
-            report.skipped = HOOK_EVENTS.iter().map(|e| (*e).to_string()).collect();
+            report.skipped = events.iter().map(|e| (*e).to_string()).collect();
             return report;
         }
     };
 
-    for event in HOOK_EVENTS {
+    for event in events.iter().copied() {
         let entry = hooks.entry(event.to_string()).or_insert_with(|| Value::Array(Vec::new()));
         let list = match entry.as_array_mut() {
             Some(list) => list,
@@ -187,13 +213,14 @@ pub fn install(settings: &mut Value, bridge: &Path, source: &str) -> InstallRepo
 pub fn verify(settings: &Value, bridge: &Path, source: &str) -> Vec<String> {
     let mut problems = Vec::new();
     let command = command_for(bridge, source);
+    let events = events_for(source);
 
     let Some(hooks) = settings.get("hooks").and_then(Value::as_object) else {
-        problems.push("settings.json 里没有 hooks 块（被 Claude Code 重生成掉了？）".to_string());
+        problems.push("配置里没有 hooks 块（被 CLI 重生成掉了？claude 是 settings.json，codex 是 hooks.json）".to_string());
         return problems;
     };
 
-    for event in HOOK_EVENTS {
+    for event in events.iter().copied() {
         let Some(list) = hooks.get(event) else {
             problems.push(format!("{event}: 缺少本项目的 hook"));
             continue;
@@ -375,4 +402,43 @@ mod tests {
             assert_eq!(entry[0]["matcher"], "", "{event}: template matcher drifted");
         }
     }
+
+    #[test]
+    fn codex_installs_only_the_events_it_measured() {
+        // Six, in codex's own order, and never SessionEnd: an event the CLI does not
+        // dispatch would sit in the config looking healthy forever.
+        assert_eq!(events_for("codex"), &CODEX_EVENTS);
+        assert_eq!(events_for("codex").len(), 6);
+        assert!(!events_for("codex").contains(&"SessionEnd"));
+        assert_eq!(events_for("claude").len(), 7);
+        assert_eq!(events_for("trae"), events_for("claude"), "unknown sources keep claude's vocabulary");
+    }
+
+    #[test]
+    fn codex_install_skips_the_event_claude_has_and_codex_does_not() {
+        let mut settings = Value::Object(Map::new());
+        let report = install(&mut settings, Path::new("/opt/ci/codeisland-bridge"), "codex");
+        assert_eq!(report.added.len(), 6, "codex must get exactly its six events");
+        let hooks = settings["hooks"].as_object().unwrap();
+        assert!(!hooks.contains_key("SessionEnd"), "codex config gained an event it never fires");
+        assert!(hooks.contains_key("PermissionRequest"));
+        // The command still names the source, or the bridge picks the wrong vocabulary.
+        assert_eq!(hooks["Stop"][0]["hooks"][0]["command"].as_str().unwrap(),
+                   "/opt/ci/codeisland-bridge --source codex");
+        assert_eq!(verify(&settings, Path::new("/opt/ci/codeisland-bridge"), "codex"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn verify_for_codex_does_not_complain_about_the_missing_session_end() {
+        // A claude-shaped verify() run over a codex file would report one phantom problem
+        // per config; the per-source event list is what prevents that.
+        let mut settings = Value::Object(Map::new());
+        install(&mut settings, Path::new("/opt/ci/codeisland-bridge"), "codex");
+        let problems = verify(&settings, Path::new("/opt/ci/codeisland-bridge"), "codex");
+        assert!(problems.is_empty(), "{problems:?}");
+        let claude_problems = verify(&settings, Path::new("/opt/ci/codeisland-bridge"), "claude");
+        assert_eq!(claude_problems.iter().filter(|p| p.starts_with("SessionEnd")).count(), 1,
+                   "claude's verifier must still notice a missing SessionEnd in a codex-only file");
+    }
+
 }
