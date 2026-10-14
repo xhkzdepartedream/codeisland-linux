@@ -503,8 +503,55 @@ pub fn discover_in(
         }
     }
 
+    // Fold subagents into the session they belong to.
+    //
+    // A subagent's transcript is a step inside a session, not a second session the human
+    // opened. Measured on this machine: codex's "Guardian review" thread carries
+    // `parent_thread_id` pointing at the conversation it reviews, and pi nests its subagent
+    // runs under the parent's own session directory. Counting them as peers overstated how
+    // many things were running -- the owner of this project saw "3 sessions" for one codex
+    // conversation plus this pi one, and asked why.
+    //
+    // Only folded when the parent is *also* being shown. A child whose parent has gone stays
+    // visible: an orphan subagent still doing work is real activity, and silently dropping it
+    // would make the island quieter than the machine. The one exception is a transcript that
+    // announces itself as a subagent without naming a parent -- there the safe reading is that
+    // it is a step, so it is folded rather than shown as a peer.
+    //
+    // (Upstream defaults to a per-subagent setting, `pluginSessionMode = "separate"`, and
+    // folds only completed children. This island folds unconditionally-with-a-present-parent
+    // instead: a compact pill that lists a reviewer as a peer of the chat it reviews reads as
+    // "two agents are running" when one is. Recorded as a deliberate divergence.)
+    let shown: Vec<String> = out.iter().map(|d| d.session_id.clone()).collect();
+    out.retain(|discovered| {
+        match child_parent(&discovered.transcript) {
+            Some(parent) if !parent.is_empty() => !shown.contains(&parent),
+            Some(_) => false,
+            None => true,
+        }
+    });
+
     // Newest first, so the island lists the sessions actually doing something on top.
     out.sort_by(|a, b| b.last_write_ms.cmp(&a.last_write_ms));
+
+    // One session id, one row.
+    //
+    // A resumed codex thread has two rollout files carrying the *same* thread uuid (measured:
+    // `rollout-…-<uuid>.jsonl` and `rollout-…-<uuid>_<second-uuid>.jsonl`). Both pair with the
+    // thread's lock, so both reach this list, and the daemon keys sessions by id -- so the last
+    // one registered wins. Registering in newest-first order then meant the *older* file won,
+    // and the row showed that stale transcript (an `event_msg` line) instead of the live one.
+    // Deduping here, after the sort, keeps the newest by construction.
+    let mut seen: Vec<String> = Vec::new();
+    out.retain(|discovered| {
+        if seen.contains(&discovered.session_id) {
+            false
+        } else {
+            seen.push(discovered.session_id.clone());
+            true
+        }
+    });
+
     out
 }
 
@@ -607,10 +654,74 @@ pub fn liveness(last_write_ms: u64, now_ms: u64, window_ms: u64) -> Liveness {
     }
 }
 
+/// The session a transcript declares itself a *child* of, if any.
+///
+/// A subagent's transcript is not a session the human opened -- it is a step inside one. The
+/// measured shapes:
+///
+/// - **codex**: a top-level `payload.parent_thread_id` on the `session_meta` row. Guardian
+///   (auto-review) threads carry exactly this, and its own `source.subagent` describes the
+///   role; upstream parses the same field (`codexSubagentMetadata`).
+/// - **pi**: a nested run directory, `<parent-session>/<child-uuid>/run-<n>/session.jsonl`,
+///   with `session_info.name` like `subagent-reviewer-…`. The parent id is the enclosing
+///   session directory's name.
+///
+/// Deliberately returns the parent id rather than just a bool: the caller drops a child only
+/// when that parent is itself being shown, so a subagent whose parent has gone is still
+/// visible instead of silently vanishing.
+pub fn child_parent(path: &Path) -> Option<String> {
+    // pi: the nesting is in the path, so this needs no file read.
+    let parts: Vec<&str> = path.iter().filter_map(|p| p.to_str()).collect();
+    if let Some(run_at) = parts.iter().position(|p| p.starts_with("run-")) {
+        if run_at >= 1 {
+            // `<…>/<parent-session-id>/<child-uuid>/run-0/session.jsonl`
+            if let Some(parent) = parts.get(run_at.saturating_sub(2)) {
+                if parent.contains('_') {
+                    return Some(parent.to_string());
+                }
+            }
+        }
+    }
+
+    let head = read_head(path, 64 * 1024)?;
+    for line in head.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        // codex: `{"type":"session_meta","payload":{"id":…,"parent_thread_id":…}}`
+        if let Some(parent) = value
+            .get("payload")
+            .and_then(|p| p.get("parent_thread_id"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(parent.to_string());
+        }
+        // pi fallback: the name marks a subagent even when the path shape is unfamiliar.
+        if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+            if name.starts_with("subagent-") {
+                return Some(String::new());
+            }
+        }
+    }
+    None
+}
+
 /// Read the tail looking for the last thing the harness recorded, used only for a one-line
 /// detail on a discovered row. Bounded, and never trusted to say anything about waiting.
 pub fn tail_hint(path: &Path) -> Option<String> {
-    let tail = read_tail(path, 8 * 1024)?;
+    let tail = read_tail(path, 16 * 1024)?;
+    // Newest first, and a tool call beats prose: "what is it doing" is the question the row is
+    // answering, and a tool call is the most literal answer the file holds. The three shapes
+    // below are the measured ones (see the module docs).
+    for line in tail.lines().rev() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(hint) = tool_call_hint(&value) {
+            return Some(hint);
+        }
+    }
     for line in tail.lines().rev() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
@@ -631,6 +742,77 @@ pub fn tail_hint(path: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// The last tool call in one transcript row, as a one-line "what is it doing".
+fn tool_call_hint(value: &serde_json::Value) -> Option<String> {
+    // codex: `{"type":"response_item","payload":{"type":"function_call","name","arguments"}}`
+    if let Some(payload) = value.get("payload") {
+        if payload.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+            let name = payload.get("name").and_then(|n| n.as_str())?;
+            return Some(summarize_tool(name, parse_arguments(payload.get("arguments"))));
+        }
+    }
+    // pi / claude: `{"message":{"content":[{"type":"toolCall"|"tool_use","name",…}]}}`
+    if let Some(blocks) = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        for block in blocks.iter().rev() {
+            let kind = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if kind == "toolCall" || kind == "tool_use" {
+                let name = block.get("name").and_then(|n| n.as_str())?;
+                let args = block.get("input").or_else(|| block.get("arguments"));
+                return Some(summarize_tool(name, parse_arguments(args)));
+            }
+        }
+    }
+    None
+}
+
+/// Tool arguments arrive as an object from pi/claude and as a JSON *string* from codex
+/// rollouts. Both are accepted; anything else becomes `None`.
+fn parse_arguments(value: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let value = value?;
+    if value.is_object() {
+        return Some(value.clone());
+    }
+    let text = value.as_str()?;
+    serde_json::from_str::<serde_json::Value>(text).ok()
+}
+
+/// One display line for a tool call: the tool name, plus what it is acting on when the
+/// harness recorded something concrete. Never invents a label for a tool it does not know.
+fn summarize_tool(name: &str, args: Option<serde_json::Value>) -> String {
+    let Some(args) = args else {
+        return name.to_string();
+    };
+    // codex's plan tool: the row is "which step is it on", so count the steps.
+    if let Some(plan) = args.get("plan").and_then(|p| p.as_array()) {
+        let current = plan.iter().find(|step| {
+            step.get("status").and_then(|s| s.as_str()) == Some("in_progress")
+        });
+        let total = plan.len();
+        if let Some(step) = current {
+            let text = step.get("step").and_then(|s| s.as_str()).unwrap_or("");
+            return format!("{} · {}/{} {}", name, index_of(plan, step) + 1, total, truncate(text, 60));
+        }
+        return format!("{name} · {total} 步");
+    }
+    for key in ["command", "cmd", "file_path", "path", "pattern", "query", "url"] {
+        if let Some(text) = args.get(key).and_then(|v| v.as_str()) {
+            let first = text.lines().next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return format!("{name} · {}", truncate(first, 90));
+            }
+        }
+    }
+    name.to_string()
+}
+
+fn index_of(list: &[serde_json::Value], needle: &serde_json::Value) -> usize {
+    list.iter().position(|item| item == needle).unwrap_or(0)
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -865,6 +1047,196 @@ mod tests {
         drop(held_lock);
         drop(held_decoy);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_subagent_is_folded_into_the_session_it_belongs_to() {
+        // Measured complaint: the island showed three sessions for a codex conversation plus one
+        // pi session, because a codex "Guardian review" subagent was counted as a peer of the
+        // chat it reviews. The parent is named in the child's own session_meta, which is the
+        // signal used here. Two live processes -> the parent is discovered too, so the child
+        // folds and exactly one row remains.
+        let root = std::env::temp_dir().join(format!("ci-discover-fold-{}", now_ms()));
+        let parent_id = "01a139b5-e5a5-77b0-a481-a86d0b4150b9";
+        let child_id = "01a13a9a-a58d-75c1-a244-440e53b540a5";
+        // The parent transcript, with fake process cwds that both point at it.
+        let dir = root.join(".codex/sessions");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("rollout-2026-10-14T20-28-07-{parent_id}.jsonl")),
+            format!("{}\n", serde_json::json!({"type":"session_meta","payload":{"cwd":"/tmp/proj","id":parent_id}})),
+        ).unwrap();
+        // The child, whose session_meta names the parent.
+        fs::write(
+            dir.join(format!("rollout-2026-10-14T21-29-35-{child_id}.jsonl")),
+            format!("{}\n", serde_json::json!({
+                "type":"session_meta",
+                "payload":{"cwd":"/tmp/proj","id":child_id,"parent_thread_id":parent_id,
+                           "source":{"subagent":{"other":"guardian"}}}
+            })),
+        ).unwrap();
+
+        let processes = vec![
+            AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj") },
+            AgentProcess { harness: Harness::Codex, pid: 11, cwd: PathBuf::from("/tmp/proj") },
+        ];
+        let mut cache = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
+        let ids: Vec<&str> = found.iter().map(|d| d.session_id.as_str()).collect();
+        assert!(ids.contains(&parent_id), "the parent must be shown: {ids:?}");
+        assert!(!ids.contains(&child_id), "the subagent must fold into it: {ids:?}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_orphan_subagent_stays_visible() {
+        // The other side of the fold: a child whose parent is not being shown is still real
+        // activity. Dropping it would make the island quieter than the machine, which is the
+        // failure mode this whole feature exists to avoid.
+        let root = std::env::temp_dir().join(format!("ci-discover-orphan-{}", now_ms()));
+        let parent_id = "00000000-0000-0000-0000-000000000000";
+        let child_id = "01a13a9a-a58d-75c1-a244-440e53b540a5";
+        let dir = root.join(".codex/sessions");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(format!("rollout-2026-10-14T21-29-35-{child_id}.jsonl")),
+            format!("{}\n", serde_json::json!({
+                "type":"session_meta",
+                "payload":{"cwd":"/tmp/proj","id":child_id,"parent_thread_id":parent_id}
+            })),
+        ).unwrap();
+        let processes = vec![AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj") }];
+        let mut cache = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
+        assert_eq!(found.len(), 1, "an orphan subagent is still a live session: {found:?}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_tool_call_becomes_the_current_step_line() {
+        // "What is it doing" is the question the row answers, and a tool call is the most
+        // literal answer the transcript holds. The three shapes below are the measured ones.
+        let dir = std::env::temp_dir().join(format!("ci-discover-step-{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+
+        // codex: function_call with arguments as a JSON *string*.
+        let codex = dir.join("codex.jsonl");
+        fs::write(&codex, format!("{}\n", serde_json::json!({
+            "type":"response_item",
+            "payload":{"type":"function_call","name":"exec_command",
+                       "arguments":"{\"cmd\":\"python train.py --steps 100\"}"}
+        }))).unwrap();
+        let hint = tail_hint(&codex).unwrap();
+        assert!(hint.contains("exec_command"), "names the tool: {hint}");
+        assert!(hint.contains("python train.py"), "and what it is running: {hint}");
+
+        // pi: message.content[].type == "toolCall".
+        let pi = dir.join("pi.jsonl");
+        fs::write(&pi, format!("{}\n", serde_json::json!({
+            "type":"message",
+            "message":{"content":[{"type":"toolCall","name":"bash",
+                                     "arguments":{"command":"cargo test --release"}}]}
+        }))).unwrap();
+        let hint = tail_hint(&pi).unwrap();
+        assert!(hint.contains("bash") && hint.contains("cargo test"), "pi shape: {hint}");
+
+        // claude: message.content[].type == "tool_use" with `input`.
+        let claude = dir.join("claude.jsonl");
+        fs::write(&claude, format!("{}\n", serde_json::json!({
+            "type":"assistant",
+            "message":{"content":[{"type":"tool_use","name":"Edit",
+                                     "input":{"file_path":"src/main.rs"}}]}
+        }))).unwrap();
+        let hint = tail_hint(&claude).unwrap();
+        assert!(hint.contains("Edit") && hint.contains("src/main.rs"), "claude shape: {hint}");
+
+        // codex's plan tool reports a position in the checklist instead of a command.
+        let plan = dir.join("plan.jsonl");
+        fs::write(&plan, format!("{}\n", serde_json::json!({
+            "type":"response_item",
+            "payload":{"type":"function_call","name":"update_plan",
+                       "arguments":{"plan":[{"step":"读代码","status":"completed"},
+                                              {"step":"改判定","status":"in_progress"},
+                                              {"step":"跑测试","status":"pending"}]}}
+        }))).unwrap();
+        let hint = tail_hint(&plan).unwrap();
+        assert!(hint.contains("2/3"), "a plan reports its position: {hint}");
+        assert!(hint.contains("改判定"), "and the current step: {hint}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_subagent_is_named_by_its_own_session_meta() {
+        let dir = std::env::temp_dir().join(format!("ci-discover-parent-{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        let child = dir.join("child.jsonl");
+        fs::write(&child, format!("{}\n", serde_json::json!({
+            "type":"session_meta",
+            "payload":{"id":"child","parent_thread_id":"parent-thread","cwd":"/repo"}
+        }))).unwrap();
+        assert_eq!(child_parent(&child).as_deref(), Some("parent-thread"));
+
+        // A top-level session names no parent.
+        let top = dir.join("top.jsonl");
+        fs::write(&top, format!("{}\n", serde_json::json!({
+            "type":"session_meta","payload":{"id":"top","cwd":"/repo"}
+        }))).unwrap();
+        assert_eq!(child_parent(&top), None);
+
+        // pi nests the child under the parent's session directory.
+        let pi_child = dir.join("2026-10-13T06-24-42-279Z_01a133ef-4927-754d-ad79-ec98df083751")
+            .join("341766e4-860a-43c4-b278-d63c1d35f57e").join("run-0").join("session.jsonl");
+        fs::create_dir_all(pi_child.parent().unwrap()).unwrap();
+        fs::write(&pi_child, "{\"type\":\"session\"}\n").unwrap();
+        assert_eq!(
+            child_parent(&pi_child).as_deref(),
+            Some("2026-10-13T06-24-42-279Z_01a133ef-4927-754d-ad79-ec98df083751")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn one_thread_with_two_rollouts_yields_one_row_and_the_newest_wins() {
+        // Measured: a resumed codex thread leaves two rollout files carrying the same thread
+        // uuid. Both pair with the thread's live lock, so both reach discovery, and because the
+        // daemon keys sessions by id, whichever registers last wins. Registering in newest-first
+        // order without deduping meant the *older* file won, and the row showed that stale
+        // transcript instead of the live one.
+        let root = std::env::temp_dir().join(format!("ci-discover-dup-{}", now_ms()));
+        let thread = "01a139b5-e5a5-77b0-a481-a86d0b4150b9";
+        let dir = root.join(".codex/sessions");
+        fs::create_dir_all(&dir).unwrap();
+        // Older file: quiet, its last record is an event message.
+        let older = dir.join(format!("rollout-2026-10-14T17-19-44-{thread}.jsonl"));
+        fs::write(&older, format!("{}\n{}", serde_json::json!({
+            "type":"session_meta","payload":{"cwd":"/tmp/proj","id":thread}}),
+            serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}}))).unwrap();
+        // Newer file: same thread, still being written.
+        let newer = dir.join(format!("rollout-2026-10-14T20-28-07-{thread}_01a13a62-5eaf-7160-93f6-471ee359a365.jsonl"));
+        fs::write(&newer, format!("{}\n{}", serde_json::json!({
+            "type":"session_meta","payload":{"cwd":"/tmp/proj","id":thread}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"function_call",
+                "name":"exec_command","arguments":"{\"cmd\":\"python train.py\"}"}}))).unwrap();
+        // Make the order unambiguous regardless of filesystem timestamp resolution.
+        filetime(&newer, now_ms());
+        filetime(&older, now_ms() - 3_600_000);
+
+        let processes = vec![AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj") }];
+        let mut cache = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
+        assert_eq!(found.len(), 1, "one thread is one row: {found:?}");
+        assert_eq!(found[0].transcript, newer, "the live rollout must win, not the stale one");
+        let hint = tail_hint(&found[0].transcript).unwrap();
+        assert!(hint.contains("python train.py"), "the row describes the live work: {hint}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// Set a file's mtime, so ordering tests do not depend on how fast the test writes.
+    fn filetime(path: &Path, ms: u64) {
+        let file = fs::File::options().write(true).open(path).unwrap();
+        let when = UNIX_EPOCH + std::time::Duration::from_millis(ms);
+        file.set_modified(when).unwrap();
     }
 
     #[test]
