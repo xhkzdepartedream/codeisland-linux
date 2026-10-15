@@ -44,6 +44,12 @@ public:
 
     bool hasPending() const { return !m_rows.isEmpty(); }
 
+    /// The card shown at `index` (index 0 is what the human sees first), as a
+    /// plain map for QML: requestId, sessionId, isQuestion. Empty map when out
+    /// of range. The global-hotkey handler uses this to decide which request a
+    /// press acts on.
+    Q_INVOKABLE QVariantMap at(int index) const;
+
 signals:
     void changed();
 

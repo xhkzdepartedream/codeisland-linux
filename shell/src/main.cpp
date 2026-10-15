@@ -5,6 +5,7 @@
 // implemented yet, so this process cannot approve anything -- see the phase plan.
 
 #include "daemon_client.h"
+#include "hotkey.h"
 #include "permission_model.h"
 #include "sessions_model.h"
 #include "surface.h"
@@ -147,9 +148,11 @@ int main(int argc, char *argv[])
     SessionsModel model;
     PermissionModel permissions;
     DaemonClient client(&model, &permissions);
+    Hotkey hotkey;
     engine.rootContext()->setContextProperty(QStringLiteral("sessions"), &model);
     engine.rootContext()->setContextProperty(QStringLiteral("permissions"), &permissions);
     engine.rootContext()->setContextProperty(QStringLiteral("daemon"), &client);
+    engine.rootContext()->setContextProperty(QStringLiteral("hotkey"), &hotkey);
 
     const QUrl url = QUrl::fromLocalFile(
         QStringLiteral(CODEISLAND_QML_DIR "/main.qml"));
@@ -176,6 +179,10 @@ int main(int argc, char *argv[])
     }
 
     client.start();
+
+    // Global hotkeys: best-effort, never fatal. Without a KDE session (no
+    // kglobalacceld on the bus) the island simply has no shortcuts.
+    hotkey.install();
 
     // Re-report the geometry after the first layout pass, because the QML margins
     // binding only settles once the window has been configured by the compositor.

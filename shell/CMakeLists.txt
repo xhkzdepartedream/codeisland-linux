@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick Network)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Qml Quick Network DBus)
 
 # Where the QML lives at run time. Development reads straight from the source
 # tree so editing a .qml file needs no rebuild; packaging overrides this.
@@ -16,6 +16,7 @@ set(CODEISLAND_QML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/qml" CACHE STRING
 qt_add_executable(codeisland-shell
     src/main.cpp
     src/daemon_client.cpp
+    src/hotkey.cpp
     src/permission_model.cpp
     src/sessions_model.cpp
 )
@@ -30,4 +31,5 @@ target_link_libraries(codeisland-shell PRIVATE
     Qt6::Qml
     Qt6::Quick
     Qt6::Network
+    Qt6::DBus
 )

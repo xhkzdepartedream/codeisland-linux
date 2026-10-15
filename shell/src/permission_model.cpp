@@ -120,3 +120,19 @@ void PermissionModel::clearAll()
     endResetModel();
     emit changed();
 }
+
+QVariantMap PermissionModel::at(int index) const
+{
+    if (index < 0 || index >= m_rows.size()) {
+        return {};
+    }
+    const Row &row = m_rows.at(index);
+    return {
+        {QStringLiteral("requestId"), row.requestId},
+        {QStringLiteral("sessionId"), row.sessionId},
+        // The same signal the QML delegate uses to tell the two cards apart:
+        // a card with questions is a question card, everything else is a plain
+        // approve/deny gate.
+        {QStringLiteral("isQuestion"), !row.questions.isEmpty()},
+    };
+}

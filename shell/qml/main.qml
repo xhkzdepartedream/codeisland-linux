@@ -99,6 +99,44 @@ Window {
         onTriggered: island.celebrating = false
     }
 
+    // ---- global hotkeys ----------------------------------------------
+    //
+    // The bindings live in kglobalacceld (installed by Hotkey in C++); QML only
+    // decides what a press acts on, mirroring upstream's CardShortcuts: a press
+    // acts on the visible card, and with no card visible it only opens the
+    // panel -- the next press acts. approve/deny never touch a question card,
+    // because answering AskUserQuestion without a choice would be deciding for
+    // the human; skip works on either kind, the same way the buttons do.
+    function handleShortcut(action) {
+        if (action === "toggle-panel") {
+            island.settingsOpen = false
+            island.pinned = !island.pinned
+            return
+        }
+        if (!island.expanded) {
+            island.pinned = true
+            return
+        }
+        const card = permissions.at(0)
+        if (card === undefined || card.requestId === undefined || card.requestId.length === 0) {
+            return
+        }
+        if (action === "skip") {
+            console.log("hotkey skip, requestId=" + card.requestId)
+            daemon.withdraw(card.requestId)
+            return
+        }
+        if (card.isQuestion || (action !== "approve" && action !== "deny")) {
+            return
+        }
+        console.log("hotkey " + action + ", requestId=" + card.requestId)
+        daemon.decide(card.requestId, action === "approve" ? "allow" : "deny")
+    }
+    Connections {
+        target: hotkey
+        function onShortcutPressed(action) { island.handleShortcut(action) }
+    }
+
     // One discrete on/off phase for a single header marker. Two repaints per
     // second, one item, no animation nodes.
     //
@@ -733,11 +771,26 @@ delegate: Rectangle {
                                 border.width: 1
                                 border.color: "#3a4a40"
 
-                                Text {
+                                Column {
                                     anchors.centerIn: parent
-                                    text: "跳过"
-                                    color: "#98989d"
-                                    font.pixelSize: 12
+                                    spacing: 1
+                                    Text {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        text: "跳过"
+                                        color: "#98989d"
+                                        font.pixelSize: 12
+                                    }
+                                    // The global-hotkey badge, upstream's shortcut
+                                    // marker. Only when the keys are actually
+                                    // installed, so a non-KDE session never promises
+                                    // a binding that is not there.
+                                    Text {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        visible: hotkey.installed
+                                        text: hotkey.shortcutLabel("skip")
+                                        color: "#5a5a5e"
+                                        font.pixelSize: 8
+                                    }
                                 }
                                 MouseArea {
                                     id: skipArea
@@ -805,13 +858,24 @@ delegate: Rectangle {
                                 color: approvalSkipArea.containsMouse ? "#1e2b22" : "#141a16"
                                 border.width: 1
                                 border.color: "#3a4a40"
-                                Text {
+                                Column {
                                     anchors.centerIn: parent
-                                    text: "跳过"
-                                    color: "#98989d"
-                                    font.pixelSize: 12
+                                    spacing: 1
+                                    Text {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        text: "跳过"
+                                        color: "#98989d"
+                                        font.pixelSize: 12
+                                    }
+                                    Text {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        visible: hotkey.installed
+                                        text: hotkey.shortcutLabel("skip")
+                                        color: "#5a5a5e"
+                                        font.pixelSize: 8
+                                    }
                                 }
-                                MouseArea {
+MouseArea {
                                     id: approvalSkipArea
                                     anchors.fill: parent
                                     hoverEnabled: true
@@ -833,13 +897,24 @@ delegate: Rectangle {
                                 color: rejectArea.containsMouse ? "#3a2f22" : "#2c2c2e"
                                 border.width: 1
                                 border.color: "#48484a"
-                                Text {
+                                Column {
                                     anchors.centerIn: parent
-                                    text: "拒绝"
-                                    color: "#eaeaea"
-                                    font.pixelSize: 12
+                                    spacing: 1
+                                    Text {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        text: "拒绝"
+                                        color: "#eaeaea"
+                                        font.pixelSize: 12
+                                    }
+                                    Text {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        visible: hotkey.installed
+                                        text: hotkey.shortcutLabel("deny")
+                                        color: "#5a5a5e"
+                                        font.pixelSize: 8
+                                    }
                                 }
-                                MouseArea {
+MouseArea {
                                     id: rejectArea
                                     anchors.fill: parent
                                     hoverEnabled: true
@@ -856,15 +931,26 @@ delegate: Rectangle {
                                 Layout.preferredHeight: 28
                                 Layout.alignment: Qt.AlignVCenter
                                 radius: 8
-                                color: allowArea.containsMouse ? "#3d8b52" : "#30d158"
-                                Text {
+color: allowArea.containsMouse ? "#3d8b52" : "#30d158"
+                                Column {
                                     anchors.centerIn: parent
-                                    text: "批准"
-                                    color: "#04150a"
-                                    font.pixelSize: 12
-                                    font.bold: true
+                                    spacing: 1
+                                    Text {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        text: "批准"
+                                        color: "#04150a"
+                                        font.pixelSize: 12
+                                        font.bold: true
+                                    }
+                                    Text {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        visible: hotkey.installed
+                                        text: hotkey.shortcutLabel("approve")
+                                        color: "#0d3a1e"
+                                        font.pixelSize: 8
+                                    }
                                 }
-                                MouseArea {
+MouseArea {
                                     id: allowArea
                                     anchors.fill: parent
                                     hoverEnabled: true
