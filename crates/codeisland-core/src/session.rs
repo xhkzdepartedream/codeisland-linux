@@ -221,6 +221,12 @@ pub enum ViewCommand {
     /// offered options fit, and it is the one command a human can always send:
     /// it asks nothing of the agent and risks nothing on its behalf.
     Withdraw { request_id: String },
+    /// "Stop / resume telling me when a turn finishes."
+    ///
+    /// The desktop-notification bell on the island's toolbar. Flipping it changes
+    /// only what the daemon tells the *human*; it never changes what any agent is
+    /// told, so it is safe to accept at any time.
+    SetNotify { on: bool },
 }
 
 /// All live sessions.
@@ -838,6 +844,20 @@ mod permission_wire_tests {
         assert!(
             !text.contains("behavior") && !text.contains("answers"),
             "a withdraw must not smell like a decision: {text}"
+        );
+    }
+
+    #[test]
+    fn a_set_notify_command_is_just_the_switch() {
+        // The toolbar bell. It only ever changes what the daemon tells the human,
+        // so both states must survive the wire exactly.
+        let on: ViewCommand = serde_json::from_str(r#"{"type":"set_notify","on":true}"#).unwrap();
+        assert_eq!(on, ViewCommand::SetNotify { on: true });
+        let off = serde_json::from_str::<ViewCommand>(r#"{"type":"set_notify","on":false}"#).unwrap();
+        assert_eq!(off, ViewCommand::SetNotify { on: false });
+        assert_eq!(
+            serde_json::to_string(&ViewCommand::SetNotify { on: true }).unwrap(),
+            r#"{"type":"set_notify","on":true}"#
         );
     }
 

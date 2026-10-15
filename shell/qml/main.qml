@@ -63,6 +63,18 @@ Window {
         sessions.needingAttention > 0 || permissions.count > 0
     property bool hovered: false
     property bool pinned: false
+    // The gear's sheet: shows the effective configuration, read-only (F26).
+    property bool settingsOpen: false
+    // The toolbar's view: all = everything, status = only rows needing a human,
+    // agent = same rows grouped by tool instead of pure urgency.
+    property string filterMode: "all"
+
+    function sessionVisible(rowStatus) {
+        if (filterMode === "status") {
+            return rowStatus === "waiting_approval" || rowStatus === "waiting_input"
+        }
+        return true
+    }
     // A finished session holds the pill open briefly so the result is seen.
     property bool celebrating: false
 
@@ -247,6 +259,61 @@ Window {
             }
         }
 
+        // ---- the settings sheet: what the gear opens --------------------------
+        // Read-only by design (F26 keeps configuration in environment variables);
+        // a display of the live truth cannot lie about what it can change.
+
+        Rectangle {
+            id: settingsSheet
+            anchors.fill: parent
+            // Declared before the cards, so it needs explicit z to cover them.
+            z: 10
+            radius: pill.radius
+            color: "#f2101012"
+            border.width: 1
+            border.color: "#1affffff"
+            visible: island.settingsOpen
+
+            // Click anywhere to close: the sheet holds no controls, only truth.
+            MouseArea {
+                anchors.fill: parent
+                onClicked: island.settingsOpen = false
+            }
+
+            Column {
+                anchors.fill: parent
+                anchors.margins: 16
+                spacing: 8
+
+                Text {
+                    text: "配置（只读，环境变量生效值）"
+                    color: "#f2f2f2"
+                    font.pixelSize: 13
+                    font.bold: true
+                }
+                Repeater {
+                    model: [
+                        "界面 socket：" + (daemon.diagnostics()["viewSocket"] || "-"),
+                        "QML 目录：" + (daemon.diagnostics()["qmlDir"] || "-"),
+                        "完成提醒：" + (daemon.notificationsOn ? "开" : "静音")
+                          + "（CODEISLAND_NOTIFY_ON_STOP=" + (daemon.diagnostics()["notifyOnStop"] || "-") + "）",
+                        "会话超时：CODEISLAND_HOOK_STALE_MS=" + (daemon.diagnostics()["hookStaleMs"] || "-"),
+                        "跳转命令：CODEISLAND_JUMP_COMMAND=" + (daemon.diagnostics()["jumpCommand"] || "-"),
+                        "常驻连接：" + (daemon.diagnostics()["connected"] ? "已连接" : "未连接"),
+                        "点任意处关闭"
+                    ]
+                    delegate: Text {
+                        required property string modelData
+                        width: settingsSheet.width - 32
+                        text: modelData
+                        color: "#98989d"
+                        font.pixelSize: 11
+                        wrapMode: Text.WrapAnywhere
+                    }
+                }
+            }
+        }
+
         // ---- expanded: cards ---------------------------------------------
 
         Column {
@@ -258,43 +325,189 @@ Window {
             opacity: island.expanded ? 1 : 0
             Behavior on opacity { NumberAnimation { duration: 140 } }
 
+            // ---- the toolbar: upstream's row of filter tabs and window controls.
+            // Every control here is real: the tabs change what the list shows,
+            // the bell flips the daemon's turn-finished notifications, the gear
+            // shows the effective configuration, the ✕ closes the island (the
+            // daemon keeps running and keeps answering hooks with silence).
+
             Item {
                 width: parent.width
-                height: 22
+                height: 26
+
                 RowLayout {
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
-                    spacing: 6
-                    visible: sessions.needingAttention > 0
+                    spacing: 4
+
+                    // Segmented tabs, one pill container so the active tab can
+                    // slide between them with one animation instead of three.
                     Rectangle {
-                        Layout.preferredWidth: 9
-                        Layout.preferredHeight: 9
                         Layout.alignment: Qt.AlignVCenter
-                        radius: 4
-                        color: "#ff9f0a"
-                        opacity: island.attentionOn ? 1.0 : 0.25
+                        radius: 8
+                        color: "#1c1c1e"
+                        border.width: 1
+                        border.color: "#2c2c2e"
+                        implicitWidth: tabRow.implicitWidth + 8
+                        implicitHeight: tabRow.implicitHeight + 6
+
+                        Row {
+                            id: tabRow
+                            anchors.centerIn: parent
+                            spacing: 2
+
+                            component FilterTab: Rectangle {
+                                id: tab
+                                required property string label
+                                required property string mode
+                                readonly property bool active: island.filterMode === mode
+                                radius: 6
+                                implicitWidth: tabText.implicitWidth + 14
+                                implicitHeight: tabText.implicitHeight + 6
+                                color: active ? "#2c2c2e" : "transparent"
+
+                                Text {
+                                    id: tabText
+                                    anchors.centerIn: parent
+                                    text: tab.label
+                                    color: tab.active ? "#f2f2f2" : "#8e8e93"
+                                    font.pixelSize: 11
+                                    font.bold: tab.active
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        island.filterMode = tab.mode
+                                        sessions.agentGrouped = (tab.mode === "agent")
+                                    }
+                                }
+                            }
+
+                            FilterTab { label: "ALL"; mode: "all" }
+                            FilterTab { label: "STATUS"; mode: "status" }
+                            FilterTab { label: "AGENT"; mode: "agent" }
+                        }
                     }
-                    Text {
-                        text: sessions.needingAttention + " 个会话需要你"
-                        color: "#ff9f0a"
-                        font.pixelSize: 13
-                        font.bold: true
+
+                    // The attention marker lives with the tabs: blinking means
+                    // "open the STATUS tab", so the two belong together.
+                    RowLayout {
+                        Layout.alignment: Qt.AlignVCenter
+                        Layout.leftMargin: 6
+                        spacing: 6
+                        visible: sessions.needingAttention > 0
+                        Rectangle {
+                            Layout.preferredWidth: 9
+                            Layout.preferredHeight: 9
+                            Layout.alignment: Qt.AlignVCenter
+                            radius: 4
+                            color: "#ff9f0a"
+                            opacity: island.attentionOn ? 1.0 : 0.25
+                        }
+                        Text {
+                            text: sessions.needingAttention + " 需要你"
+                            color: "#ff9f0a"
+                            font.pixelSize: 11
+                            font.bold: true
+                        }
                     }
                 }
-                Text {
-                    anchors.left: parent.left
-                    anchors.verticalCenter: parent.verticalCenter
-                    visible: sessions.needingAttention === 0
-                    text: sessions.count + " 个会话"
-                    color: "#eaeaea"
-                    font.pixelSize: 13
-                    font.bold: true
-                }
-                Text {
+
+                RowLayout {
                     anchors.right: parent.right
-                    text: daemon.connected ? "" : "常驻程序未连接"
-                    color: "#ff9f0a"
-                    font.pixelSize: 11
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 10
+
+                    // The bell: turn-finished notifications on/off. Real state,
+                    // real command -- never a decorative icon.
+                    Item {
+                        Layout.preferredWidth: 18
+                        Layout.preferredHeight: 18
+                        // A speaker drawn from primitives: colour emoji would
+                        // break the monochrome upstream look.
+                        Rectangle {  // the speaker box
+                            anchors.left: parent.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: 5
+                            height: 7
+                            radius: 1
+                            color: daemon.notificationsOn ? "#eaeaea" : "#48484a"
+                        }
+                        Canvas {  // the cone
+                            id: cone
+                            anchors.left: parent.left
+                            anchors.leftMargin: 5
+                            anchors.verticalCenter: parent.verticalCenter
+                            width: 8
+                            height: 12
+                            onPaint: {
+                                const ctx = getContext("2d")
+                                ctx.reset()
+                                ctx.fillStyle = daemon.notificationsOn ? "#eaeaea" : "#48484a"
+                                ctx.beginPath()
+                                ctx.moveTo(0, 3)
+                                ctx.lineTo(width, 0)
+                                ctx.lineTo(width, height)
+                                ctx.lineTo(0, height - 3)
+                                ctx.closePath()
+                                ctx.fill()
+                            }
+                            Connections {
+                                target: daemon
+                                function onNotificationsChanged() { cone.requestPaint() }
+                            }
+                        }
+                        // Muted: a slash across the cone.
+                        Rectangle {
+                            anchors.centerIn: parent
+                            width: 20
+                            height: 2
+                            radius: 1
+                            rotation: -35
+                            color: "#ff9f0a"
+                            visible: !daemon.notificationsOn
+                        }
+                        MouseArea {
+                            id: bellArea
+                            anchors.fill: parent
+                            anchors.margins: -4
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: daemon.setNotificationsOn(!daemon.notificationsOn)
+                        }
+                    }
+
+                    // The gear: the effective configuration, read-only (F26).
+                    Text {
+                        text: "\u2699"
+                        color: gearArea.containsMouse ? "#f2f2f2" : "#8e8e93"
+                        font.pixelSize: 14
+                        MouseArea {
+                            id: gearArea
+                            anchors.fill: parent
+                            anchors.margins: -6
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: island.settingsOpen = !island.settingsOpen
+                        }
+                    }
+
+                    // The ✕: closes the island window. The daemon keeps running,
+                    // and its safety contract keeps answering hooks with silence.
+                    Text {
+                        text: "\u2715"
+                        color: quitArea.containsMouse ? "#ff453a" : "#8e8e93"
+                        font.pixelSize: 12
+                        MouseArea {
+                            id: quitArea
+                            anchors.fill: parent
+                            anchors.margins: -6
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: Qt.quit()
+                        }
+                    }
                 }
             }
 
@@ -580,6 +793,36 @@ delegate: Rectangle {
                             visible: !cardRoot.isQuestion
                             Item { Layout.fillWidth: true }
 
+                            // 跳过. Upstream has it on every card; the daemon's
+                            // withdraw is indifferent to what kind of request it
+                            // releases, so an approval escapes to the terminal the
+                            // same way a question does. Neither yes nor no -- the
+                            // CLI asks again where the human already is.
+                            Rectangle {
+                                Layout.preferredWidth: 58
+                                Layout.preferredHeight: 28
+                                radius: 8
+                                color: approvalSkipArea.containsMouse ? "#1e2b22" : "#141a16"
+                                border.width: 1
+                                border.color: "#3a4a40"
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "跳过"
+                                    color: "#98989d"
+                                    font.pixelSize: 12
+                                }
+                                MouseArea {
+                                    id: approvalSkipArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        console.log("approval skipped, requestId=" + requestId)
+                                        daemon.withdraw(requestId)
+                                    }
+                                }
+                            }
+
                             // 拒绝 / 批准. These are the two outcomes the daemon can
                             // hand back; anything else is silence, and that path is
                             // taken by the clock or a vanished island, never a button.
@@ -651,19 +894,24 @@ delegate: Rectangle {
                     required property string branch
                     required property bool statusStated
                     required property real lastEventMs
+                    required property real startedMs
 
                     // The list is capped so a long tail of sessions cannot push the
                     // island past the screen; the "+N more" row below counts what is
-                    // hidden here. Positioners leave invisible children out of both
-                    // the layout and implicitHeight, which is what the window height
-                    // is now derived from -- so hidden cards cost no space at all.
-                    visible: index < island.visibleCount
+                    // hidden here. The STATUS tab narrows it to the rows that need
+                    // a human. Positioners leave invisible children out of both the
+                    // layout and implicitHeight, which is what the window height is
+                    // now derived from -- so hidden cards cost no space at all.
+                    visible: index < island.visibleCount && island.sessionVisible(status)
 
                     width: parent ? parent.width : 0
-                    height: 68
+                    height: 56
                     radius: 14
                     color: "#1c1c1e"
                     border.width: 1
+                    // Upstream dims finished cards: done is information, not
+                    // action, and a quieter card says so at a glance.
+                    opacity: status === "done" ? 0.7 : 1
                     readonly property bool blocked:
                         status === "waiting_approval" || status === "waiting_input"
                     // `AnimatedImage.source` shadows the delegate's `source`, so the mascot path
@@ -688,15 +936,15 @@ delegate: Rectangle {
                         // One animated GIF per supported tool; an unknown source falls back
                         // to the status dot so the row never renders empty.
                         Item {
-                            Layout.preferredWidth: 32
-                            Layout.preferredHeight: 32
+                            Layout.preferredWidth: 28
+                            Layout.preferredHeight: 28
                             Layout.alignment: Qt.AlignVCenter
 
                             AnimatedImage {
                                 id: mascot
                                 anchors.centerIn: parent
-                                width: 32
-                                height: 32
+                                width: 28
+                                height: 28
                                 // QML resolves this relative to the .qml file, so it works
                                 // from the source tree and from a packaged copy alike.
                                 // AnimatedImage, not Image: a plain Image shows GIF frame 1
@@ -730,19 +978,23 @@ delegate: Rectangle {
                             RowLayout {
                                 width: parent.width
                                 spacing: 6
+                                // Upstream's headline shape: the project folder bold,
+                                // the conversation's own title trailing after a # in
+                                // grey. Both stay because they answer different
+                                // questions -- the folder is *where*, the title is *what*.
                                 Text {
-                                    Layout.fillWidth: true
-                                    // The conversation's own title when the harness
-                                    // stated one (codex thread name, claude
-                                    // custom-title, first user prompt); the project
-                                    // folder otherwise. Upstream leads with the folder
-                                    // and trails the title -- this island has one
-                                    // line, so the title wins and the folder is the
-                                    // fallback.
-                                    text: title.length > 0 ? title : project
+                                    text: project
                                     color: "#f2f2f2"
-                                    font.pixelSize: 14
+                                    font.pixelSize: 13
                                     font.bold: true
+                                    elide: Text.ElideMiddle
+                                }
+                                Text {
+                                    visible: title.length > 0
+                                    Layout.fillWidth: true
+                                    text: "#" + title
+                                    color: "#8e8e93"
+                                    font.pixelSize: 12
                                     elide: Text.ElideRight
                                 }
                                 // Git branch: the second thing a human uses to tell two
@@ -753,7 +1005,7 @@ delegate: Rectangle {
                                     color: "#8e8e93"
                                     font.pixelSize: 11
                                     elide: Text.ElideRight
-                                    Layout.maximumWidth: 160
+                                    Layout.maximumWidth: 120
                                 }
                             }
                             Text {
@@ -770,12 +1022,25 @@ delegate: Rectangle {
                         Column {
                             Layout.alignment: Qt.AlignVCenter
                             spacing: 2
+                            // Elapsed since the session appeared -- upstream's corner
+                            // figure, ticking with the island's one-second clock.
+                            Text {
+                                Layout.alignment: Qt.AlignRight
+                                text: island.humanize(island.nowMs - startedMs)
+                                color: "#636366"
+                                font.pixelSize: 11
+                            }
                             // Status word in the state's colour, tinted like upstream's chip.
                             // "working" is the unremarkable case and stays grey so the eye
-                            // lands on the rows that need something.
+                            // lands on the rows that need something. A discovered row whose
+                            // status came from the freshness fallback keeps its honest
+                            // "推断" marker on the chip itself -- a guess never looks like
+                            // a report, and with the old source line gone this is its home.
                             Rectangle {
                                 Layout.alignment: Qt.AlignRight
                                 radius: 6
+                                readonly property string label: island.statusText(status)
+                                    + (origin === "discovered" && !statusStated ? "·推断" : "")
                                 implicitWidth: statusLabel.implicitWidth + 12
                                 implicitHeight: statusLabel.implicitHeight + 4
                                 color: status === "working" || status === "idle"
@@ -787,27 +1052,12 @@ delegate: Rectangle {
                                 Text {
                                     id: statusLabel
                                     anchors.centerIn: parent
-                                    text: island.statusText(status)
+                                    text: parent.label
                                     color: status === "working" || status === "idle"
                                            ? "#98989d"
                                            : island.statusColor(status)
                                     font.pixelSize: 11
                                 }
-                            }
-                            Text {
-                                Layout.alignment: Qt.AlignRight
-                                // A discovered row can carry two kinds of status. When the
-                                // transcript states the turn state (codex task_complete, pi
-                                // toolCall-vs-text, claude tool_use-vs-text) the status is a
-                                // fact and reads like a hook's -- no hedge. When it came from
-                                // the freshness fallback, the row says "推断" so a guess never
-                                // looks like a report.
-                                text: (origin === "discovered" && !statusStated
-                                       ? source + " ·推断" : source)
-                                      + " · " + island.humanize(island.nowMs - lastEventMs)
-                                color: "#636366"
-                                font.pixelSize: 11
-                                horizontalAlignment: Text.AlignRight
                             }
                         }
                     }
@@ -821,6 +1071,49 @@ delegate: Rectangle {
                 text: "+" + (sessions.count - 3) + " 个更多"
                 color: "#636366"
                 font.pixelSize: 11
+            }
+
+            // The STATUS tab with nothing to need you: say so, so an empty list
+            // reads as "all clear" rather than as a broken view.
+            Text {
+                visible: island.filterMode === "status" && sessions.needingAttention === 0
+                width: parent.width
+                horizontalAlignment: Text.AlignHCenter
+                text: "没有会话需要你"
+                color: "#636366"
+                font.pixelSize: 11
+            }
+
+            // ---- the bottom bar: upstream's last line, filled with what this
+            // island truly knows. Upstream shows usage quotas (F7); ours shows
+            // live session counts, which is the same slot with honest content.
+            Rectangle {
+                width: parent.width
+                height: 1
+                color: "#2c2c2e"
+            }
+            RowLayout {
+                width: parent.width
+                spacing: 6
+                Text {
+                    Layout.fillWidth: true
+                    text: sessions.sourceSummary
+                    color: "#636366"
+                    font.pixelSize: 11
+                    elide: Text.ElideRight
+                }
+                Text {
+                    visible: !daemon.connected
+                    text: "常驻程序未连接"
+                    color: "#ff9f0a"
+                    font.pixelSize: 11
+                }
+                Text {
+                    visible: !daemon.notificationsOn
+                    text: "已静音"
+                    color: "#636366"
+                    font.pixelSize: 11
+                }
             }
         }
     }

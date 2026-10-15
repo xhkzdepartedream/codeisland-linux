@@ -47,6 +47,11 @@ class SessionsModel final : public QAbstractListModel
     /// Number of sessions currently needing a human.
     Q_PROPERTY(int needingAttention READ needingAttention NOTIFY changed)
     Q_PROPERTY(int count READ rowCount NOTIFY changed)
+    /// The toolbar's AGENT view: same rows, grouped by tool instead of pure
+    /// urgency. Urgency still rules inside each group.
+    Q_PROPERTY(bool agentGrouped READ agentGrouped WRITE setAgentGrouped NOTIFY agentGroupedChanged)
+    /// "codex 2 · pi 1" for the bottom bar: live sessions per tool.
+    Q_PROPERTY(QString sourceSummary READ sourceSummary NOTIFY changed)
 
 public:
     enum Roles {
@@ -67,6 +72,9 @@ public:
 
     explicit SessionsModel(QObject *parent = nullptr);
 
+    bool agentGrouped() const { return m_agentGrouped; }
+    void setAgentGrouped(bool grouped);
+
     int rowCount(const QModelIndex &parent = {}) const override;
     QVariant data(const QModelIndex &index, int role) const override;
     QHash<int, QByteArray> roleNames() const override;
@@ -83,21 +91,26 @@ public:
 
     QString headlineStatus() const;
     int needingAttention() const;
+    QString sourceSummary() const;
 
     /// Last path component of the working directory: the card's title.
     static QString projectLabel(const QString &cwd, const QString &fallback);
 
 signals:
     void changed();
+    void agentGroupedChanged();
 
 private:
     // Urgency ranks, low first. Mirrors SessionStatus::urgency in Rust; the two
     // must stay in step or the island and the daemon disagree about ordering.
     static int urgency(const QString &status);
+    // Fixed per-tool order for the AGENT view.
+    static int agentRank(const QString &source);
     void sortRows();
 
     QVector<SessionRow> m_rows;
     QHash<QString, int> m_indexById;
+    bool m_agentGrouped = false;
 };
 
 QML_DECLARE_TYPE(SessionsModel)

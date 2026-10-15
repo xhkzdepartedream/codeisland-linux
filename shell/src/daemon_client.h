@@ -11,6 +11,7 @@
 #include <QJsonObject>
 #include <QObject>
 #include <QTimer>
+#include <QVariant>
 
 class QLocalSocket;
 class PermissionModel;
@@ -61,8 +62,22 @@ public:
     /// it promises nothing on the human's behalf.
     Q_INVOKABLE void withdraw(const QString &requestId);
 
+    /// The toolbar bell state: whether the daemon notifies when a turn finishes.
+    /// Initial value mirrors the daemon's reading of CODEISLAND_NOTIFY_ON_STOP;
+    /// flipping it sends `set_notify`, which changes only what the human is told.
+    Q_PROPERTY(bool notificationsOn READ notificationsOn NOTIFY notificationsChanged)
+    bool notificationsOn() const { return m_notificationsOn; }
+    Q_INVOKABLE void setNotificationsOn(bool on);
+
+    /// What the settings sheet shows: effective sockets and configuration. Read-only
+    /// -- the whole project is configured by environment variables (F26), and a
+    /// display of the live truth beats a settings UI that lies about what it can
+    /// change.
+    Q_INVOKABLE QVariantMap diagnostics() const;
+
 signals:
     void connectedChanged();
+    void notificationsChanged();
 
 private:
     void connectToDaemon();
@@ -79,4 +94,5 @@ private:
     QByteArray m_buffer;
     bool m_connected = false;
     bool m_stopping = false;
+    bool m_notificationsOn = true;
 };

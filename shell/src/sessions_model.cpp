@@ -199,6 +199,37 @@ int SessionsModel::needingAttention() const
     return total;
 }
 
+QString SessionsModel::sourceSummary() const
+{
+    // Fixed reading order, unknown tools last, so the line does not jitter
+    // between updates.
+    QStringList parts;
+    const auto add = [&parts](const QString &source, int count) {
+        if (count > 0) {
+            parts << QStringLiteral("%1 %2").arg(source).arg(count);
+        }
+    };
+    int claude = 0, codex = 0, pi = 0, other = 0;
+    for (const SessionRow &row : m_rows) {
+        if (row.source == QLatin1String("claude")) {
+            ++claude;
+        } else if (row.source == QLatin1String("codex")) {
+            ++codex;
+        } else if (row.source == QLatin1String("pi")) {
+            ++pi;
+        } else {
+            ++other;
+        }
+    }
+    add(QStringLiteral("claude"), claude);
+    add(QStringLiteral("codex"), codex);
+    add(QStringLiteral("pi"), pi);
+    if (parts.isEmpty()) {
+        return QStringLiteral("0");
+    }
+    return parts.join(QStringLiteral(" · "));
+}
+
 int SessionsModel::urgency(const QString &status)
 {
     // Order must match SessionStatus::urgency() in crates/codeisland-core/src/session.rs.
@@ -212,6 +243,26 @@ int SessionsModel::urgency(const QString &status)
 
 void SessionsModel::sortRows()
 {
+    if (m_agentGrouped) {
+        // The toolbar's AGENT view: same sessions, grouped by tool. Urgency still
+        // rules inside a group -- a waiting session still beats a working one --
+        // but the groups themselves sit in a fixed order so the eye can scan one
+        // agent at a time, which is the point of the tab.
+        std::stable_sort(m_rows.begin(), m_rows.end(), [](const SessionRow &a, const SessionRow &b) {
+            const int ga = agentRank(a.source);
+            const int gb = agentRank(b.source);
+            if (ga != gb) {
+                return ga < gb;
+            }
+            const int ua = urgency(a.status);
+            const int ub = urgency(b.status);
+            if (ua != ub) {
+                return ua < ub;
+            }
+            return a.lastEventMs > b.lastEventMs;
+        });
+        return;
+    }
     std::stable_sort(m_rows.begin(), m_rows.end(), [](const SessionRow &a, const SessionRow &b) {
         const int ua = urgency(a.status);
         const int ub = urgency(b.status);
@@ -220,6 +271,37 @@ void SessionsModel::sortRows()
         }
         return a.lastEventMs > b.lastEventMs;
     });
+}
+
+int SessionsModel::agentRank(const QString &source)
+{
+    // A fixed, readable order; anything unknown sorts last so adding a harness
+    // needs no change here.
+    if (source == QLatin1String("claude")) {
+        return 0;
+    }
+    if (source == QLatin1String("codex")) {
+        return 1;
+    }
+    if (source == QLatin1String("pi")) {
+        return 2;
+    }
+    return 3;
+}
+
+void SessionsModel::setAgentGrouped(bool grouped)
+{
+    if (m_agentGrouped == grouped) {
+        return;
+    }
+    m_agentGrouped = grouped;
+    if (!m_rows.isEmpty()) {
+        beginResetModel();
+        sortRows();
+        endResetModel();
+    }
+    emit agentGroupedChanged();
+    emit changed();
 }
 
 QString SessionsModel::projectLabel(const QString &cwd, const QString &fallback)

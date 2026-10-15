@@ -41,6 +41,13 @@ DaemonClient::DaemonClient(SessionsModel *model, PermissionModel *permissions,
     , m_model(model)
     , m_permissions(permissions)
     , m_socket(new QLocalSocket(this))
+    // Same rule the daemon applies to CODEISLAND_NOTIFY_ON_STOP, read once: the
+    // two must agree unless the human flips the bell, which is exactly what the
+    // set_notify command is for.
+    , m_notificationsOn([] {
+        const QByteArray raw = qgetenv("CODEISLAND_NOTIFY_ON_STOP").toLower().trimmed();
+        return !(raw == "0" || raw == "false" || raw == "off" || raw == "no");
+    }())
 {
     m_retry.setSingleShot(true);
     m_retry.setInterval(kRetryMs);
@@ -228,8 +235,7 @@ void DaemonClient::withdraw(const QString &requestId)
 }
 
 void DaemonClient::writeDecision(const QJsonObject &payload)
-{
-    QByteArray line = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+{    QByteArray line = QJsonDocument(payload).toJson(QJsonDocument::Compact);
     line.append('\n');
 
     if (m_socket->state() != QLocalSocket::ConnectedState) {
@@ -308,4 +314,47 @@ void DaemonClient::scheduleReconnect()
     if (!m_stopping && !m_retry.isActive()) {
         m_retry.start();
     }
+}
+
+void DaemonClient::setNotificationsOn(bool on)
+{
+    if (on == m_notificationsOn) {
+        return;
+    }
+    m_notificationsOn = on;
+    emit notificationsChanged();
+    qInfo() << "codeisland-shell: setNotificationsOn() called" << on;
+
+    QJsonObject payload{
+        {QStringLiteral("type"), QStringLiteral("set_notify")},
+        {QStringLiteral("on"), on},
+    };
+    QByteArray line = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    line.append('\n');
+    if (m_socket->state() != QLocalSocket::ConnectedState) {
+        // The daemon keeps its own startup value until it can be told otherwise;
+        // say so rather than pretending the bell flipped.
+        qWarning() << "codeisland-shell: set_notify dropped, daemon not connected";
+        return;
+    }
+    if (m_socket->write(line) < 0) {
+        qWarning() << "codeisland-shell: failed to send set_notify" << m_socket->errorString();
+    }
+}
+
+QVariantMap DaemonClient::diagnostics() const
+{
+    auto env = [](const char *name) {
+        const QByteArray value = qgetenv(name);
+        return value.isEmpty() ? QStringLiteral("（未设置，用默认）") : QString::fromLocal8Bit(value);
+    };
+    return {
+        {QStringLiteral("viewSocket"), resolveViewSocketPath()},
+        {QStringLiteral("qmlDir"), QStringLiteral(CODEISLAND_QML_DIR)},
+        {QStringLiteral("notifyOnStop"), env("CODEISLAND_NOTIFY_ON_STOP")},
+        {QStringLiteral("hookStaleMs"), env("CODEISLAND_HOOK_STALE_MS")},
+        {QStringLiteral("jumpCommand"), env("CODEISLAND_JUMP_COMMAND")},
+        {QStringLiteral("notificationsOn"), m_notificationsOn},
+        {QStringLiteral("connected"), m_connected},
+    };
 }

@@ -432,6 +432,16 @@ fn read_viewer(viewer_id: u64, shared: &Arc<Shared>) {
                                 ),
                             }
                         }
+                        Ok(ViewCommand::SetNotify { on }) => {
+                            // The toolbar bell. This only changes what the daemon tells
+                            // the human; agents are told nothing either way, so the
+                            // switch is safe to take at any moment.
+                            shared.notify_on_stop.store(on, Ordering::Relaxed);
+                            println!(
+                                "codeisland-daemon: turn-finished notifications {} by viewer {viewer_id}",
+                                if on { "resumed" } else { "muted" }
+                            );
+                        }
                         Err(err) => {
                             eprintln!("codeisland-daemon: malformed command from viewer: {err}")
                         }
