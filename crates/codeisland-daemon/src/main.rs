@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use codeisland_core::event::RouteKind;
-use codeisland_core::protocol::{permission_answer, Behavior, HookEvent};
+use codeisland_core::protocol::{permission_answer, permission_session_allow, Behavior, HookEvent};
 use codeisland_core::question::{self, Question};
 use codeisland_core::session::{AnswerChoice, PermissionRequestView, SessionRegistry, SessionStatus, ViewUpdate};
 use codeisland_core::socket_path;
@@ -344,8 +344,10 @@ fn read_viewer(viewer_id: u64, shared: &Arc<Shared>) {
                             request_id,
                             behavior,
                             answers,
+                            session_rule,
                         }) => {
-                            let decision = decision_for(&shared, &request_id, behavior, answers);
+                            let decision =
+                                decision_for(&shared, &request_id, behavior, answers, session_rule);
                             let answered = match (&decision, shared.pending.lock()) {
                                 (Some(decision), Ok(mut pending)) => {
                                     pending.answer(&request_id, decision.clone()).is_some()
@@ -657,6 +659,7 @@ fn handle_permission(
             &request.request_id,
             viewer_id,
             &request.session_id,
+            &request.source,
             request.questions.clone(),
             event.tool_input.clone(),
         );
@@ -698,11 +701,20 @@ fn handle_permission(
 
     match decision {
         Some(decision) => {
-            let body = permission_answer(
-                "PermissionRequest",
-                decision.behavior,
-                decision.updated_input.as_ref(),
-            );
+            let body = if decision.allow_session_rule && decision.behavior == Behavior::Allow {
+                // "Always allow this tool for the rest of this session": Claude
+                // Code's native envelope, carrying an addRules/destination=session
+                // entry. Only ever produced for a verified-claude request (see
+                // decision_for), so the envelope cannot be sent to a CLI that
+                // would not understand it.
+                permission_session_allow("PermissionRequest", event.tool_name.as_deref().unwrap_or(""))
+            } else {
+                permission_answer(
+                    "PermissionRequest",
+                    decision.behavior,
+                    decision.updated_input.as_ref(),
+                )
+            };
             stream.write_all(body.as_bytes())?;
             stream.flush()?;
             println!(
@@ -711,6 +723,13 @@ fn handle_permission(
                 if decision.updated_input.is_some() { " with rewritten input" } else { "" },
                 request.request_id
             );
+            if decision.allow_session_rule {
+                println!(
+                    "codeisland-daemon:   -> session rule recorded for {} on request {}",
+                    event.tool_name.as_deref().unwrap_or("?"),
+                    request.request_id
+                );
+            }
         }
         None => {
             // Silence: the bridge writes nothing and the CLI prompts itself.
@@ -764,6 +783,7 @@ fn decision_for(
     request_id: &str,
     behavior: Behavior,
     answers: Vec<AnswerChoice>,
+    session_rule: bool,
 ) -> Option<Decision> {
     let card = match shared.pending.lock() {
         Ok(pending) => pending.question_of(request_id),
@@ -771,12 +791,31 @@ fn decision_for(
     };
 
     let Some((questions, input)) = card else {
-        // Not a question card, so the click is an ordinary approve/deny.
+        // Not a question card, so the click is an ordinary approve/deny. A
+        // session-scoped rule is only real for Claude Code, whose reply envelope
+        // is the one we have verified can carry it; anything else degrades to a
+        // one-time allow rather than fabricating a rule for a CLI that would not
+        // understand it.
+        if session_rule && behavior == Behavior::Allow {
+            let source = match shared.pending.lock() {
+                Ok(pending) => pending.source_of(request_id),
+                Err(poisoned) => poisoned.into_inner().source_of(request_id),
+            };
+            if source.as_deref() == Some("claude") {
+                return Some(Decision::session_allow());
+            }
+            println!(
+                "codeisland-daemon: session rule requested for source {:?} on {request_id}, degrading to one-time allow",
+                source
+            );
+        }
         return Some(Decision::plain(behavior));
     };
 
     // A question card ignores the `behavior` field: answering it *is* allowing the
-    // tool, and the CLI only wants the rewritten input back.
+    // tool, and the CLI only wants the rewritten input back. It also ignores the
+    // session-rule flag: answering a question is not approving a tool for the rest
+    // of the session.
     let pairs: Vec<(String, String)> = answers
         .into_iter()
         .map(|answer| (answer.question, answer.label))
@@ -907,9 +946,9 @@ mod tests {
         let shared = Arc::new(Shared::new(test_journal("t1")));
         {
             let mut pending = shared.pending.lock().unwrap();
-            let _rx = pending.park("p1", 0, "s1", Vec::new(), None);
+            let _rx = pending.park("p1", 0, "s1", "claude", Vec::new(), None);
         }
-        let decision = decision_for(&shared, "p1", Behavior::Allow, Vec::new());
+        let decision = decision_for(&shared, "p1", Behavior::Allow, Vec::new(), false);
         assert_eq!(
             decision,
             Some(Decision::plain(Behavior::Allow)),
@@ -933,17 +972,17 @@ mod tests {
             "options": [{"label": "Red"}, {"label": "Blue"}]}]});
         {
             let mut pending = shared.pending.lock().unwrap();
-            let _rx = pending.park("q1", 0, "s1", questions, Some(input));
+            let _rx = pending.park("q1", 0, "s1", "claude", questions, Some(input));
         }
 
         assert_eq!(
-            decision_for(&shared, "q1", Behavior::Allow, Vec::new()),
+            decision_for(&shared, "q1", Behavior::Allow, Vec::new(), false),
             None,
             "no selection is not an answer"
         );
 
         let picked = vec![AnswerChoice { question: "Red or blue?".into(), label: "Blue".into() }];
-        let decision = decision_for(&shared, "q1", Behavior::Allow, picked).expect("a full answer");
+        let decision = decision_for(&shared, "q1", Behavior::Allow, picked, false).expect("a full answer");
         assert_eq!(decision.behavior, Behavior::Allow);
         let input = decision.updated_input.expect("a question answer rewrites the input");
         assert_eq!(input["answers"]["Red or blue?"], serde_json::json!("Blue"));

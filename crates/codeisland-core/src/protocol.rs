@@ -90,6 +90,36 @@ pub fn permission_answer(
     )
 }
 
+/// The allow envelope that also records a *session-scoped* rule, so the CLI
+/// stops asking for this tool for the rest of the session.
+///
+/// This is Claude Code's native "always allow" path, verified against the
+/// installed `claude` binary and against upstream's `approvePermission(always:)`:
+/// an `allow` decision may carry `updatedPermissions` with
+/// `{type: "addRules", behavior: "allow", destination: "session"}` and the rules
+/// apply from then on. Two details are load-bearing:
+///
+/// - MCP tools (`mcp__server__tool`) must carry the bare tool name with no
+///   `ruleContent`: Claude Code assembles `mcp__server__tool(*)` when a rule
+///   specifier is present, which never matches an actual MCP call, so the rule
+///   silently fails to persist and the same approval keeps re-prompting.
+/// - Everything else (Bash/Read/Edit/...) gets `ruleContent: "*"`, which means
+///   "any invocation of this tool".
+///
+/// Only meaningful for Claude Code; other CLIs either have their own rule
+/// machinery (codex) or none (pi), and the daemon never calls this for them.
+pub fn permission_session_allow(event_name: &str, tool_name: &str) -> String {
+    let rule = if tool_name.starts_with("mcp__") {
+        format!(r#"{{"toolName":"{tool_name}"}}"#)
+    } else {
+        format!(r#"{{"toolName":"{tool_name}","ruleContent":"*"}}"#)
+    };
+    format!(
+        r#"{{"hookSpecificOutput":{{"hookEventName":"{}","decision":{{"behavior":"allow","updatedPermissions":[{{"type":"addRules","rules":[{rule}],"behavior":"allow","destination":"session"}}]}}}}}}"#,
+        event_name
+    )
+}
+
 /// A fully parsed hook event on its way from bridge to daemon.
 ///
 /// Every field is optional except the ones we key sessions on: agent CLIs differ
@@ -261,6 +291,27 @@ mod tests {
         assert_eq!(
             out,
             r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}"#
+        );
+    }
+
+    #[test]
+    fn a_session_rule_carries_the_claude_updated_permissions_envelope() {
+        let out = permission_session_allow("PermissionRequest", "Bash");
+        assert_eq!(
+            out,
+            r#"{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow","updatedPermissions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"*"}],"behavior":"allow","destination":"session"}]}}}"#
+        );
+        // The rule must not claim it can do something it cannot: an MCP tool gets a
+        // bare toolName, because `mcp__server__tool(*)` never matches a real call.
+        let mcp = permission_session_allow("PermissionRequest", "mcp__weather__get");
+        assert!(mcp.contains(r#"{"toolName":"mcp__weather__get"}"#), "{mcp}");
+        assert!(!mcp.contains("ruleContent"), "{mcp}");
+        // Parseable end to end, like every reply the CLI has to trust.
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["hookSpecificOutput"]["decision"]["behavior"], "allow");
+        assert_eq!(
+            parsed["hookSpecificOutput"]["decision"]["updatedPermissions"][0]["destination"],
+            "session"
         );
     }
 

@@ -142,6 +142,22 @@ void DaemonClient::decide(const QString &requestId, const QString &behavior)
     writeDecision(payload);
 }
 
+void DaemonClient::decideAlways(const QString &requestId)
+{
+    qInfo() << "codeisland-shell: decideAlways() called" << requestId;
+    if (requestId.isEmpty()) {
+        qWarning() << "codeisland-shell: decideAlways() dropped: empty request id";
+        return;
+    }
+    QJsonObject payload{
+        {QStringLiteral("type"), QStringLiteral("permission_decision")},
+        {QStringLiteral("request_id"), requestId},
+        {QStringLiteral("behavior"), QStringLiteral("allow")},
+        {QStringLiteral("session_rule"), true},
+    };
+    writeDecision(payload);
+}
+
 void DaemonClient::answer(const QString &requestId, const QVariantList &answers)
 {
     qInfo() << "codeisland-shell: answer() called" << requestId << "entries:" << answers.size();

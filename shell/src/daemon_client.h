@@ -55,6 +55,14 @@ public:
     /// card simply stays where it is.
     Q_INVOKABLE void jump(const QString &sessionId);
 
+    /// Approve *and* record a session-scoped "always allow this tool" rule.
+    ///
+    /// Sends `session_rule: true` with an allow decision. The daemon only honours
+    /// it for Claude Code -- the one source whose reply envelope is verified to
+    /// carry the rule; any other source degrades to a one-time allow, and the
+    /// button is only shown for claude cards anyway.
+    Q_INVOKABLE void decideAlways(const QString &requestId);
+
     /// Skip a card: the human will answer in the terminal instead.
     ///
     /// Neither allow nor deny -- the daemon releases the hook to silence so the

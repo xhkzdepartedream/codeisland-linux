@@ -20,10 +20,15 @@ use serde_json::Value;
 /// `updated_input` carries a rewritten tool input, which is the only way to answer
 /// `AskUserQuestion` (measured 2026-10-14). It is meaningless for a bare approve or
 /// deny, and a question card must never be resolved without it.
+///
+/// `allow_session_rule` marks an allow that should also record a session-scoped
+/// "always allow this tool" rule with the CLI. Only Claude Code understands that
+/// envelope, and only an allow can carry it -- a deny never does.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
     pub behavior: Behavior,
     pub updated_input: Option<Value>,
+    pub allow_session_rule: bool,
 }
 
 impl Decision {
@@ -32,6 +37,16 @@ impl Decision {
         Self {
             behavior,
             updated_input: None,
+            allow_session_rule: false,
+        }
+    }
+
+    /// Approve *and* record a session-scoped rule so the CLI stops asking.
+    pub fn session_allow() -> Self {
+        Self {
+            behavior: Behavior::Allow,
+            updated_input: None,
+            allow_session_rule: true,
         }
     }
 
@@ -39,6 +54,7 @@ impl Decision {
         Self {
             behavior: Behavior::Allow,
             updated_input: Some(updated_input),
+            allow_session_rule: false,
         }
     }
 }
@@ -54,6 +70,10 @@ struct Entry {
     /// that session is still waiting on a human, and a session can have more than
     /// one card up at a time.
     session_id: String,
+    /// Which CLI raised this request. Decides whether a session-scoped rule can
+    /// be recorded: only Claude Code understands `updatedPermissions`, so the
+    /// daemon must not send that envelope to anyone else.
+    source: String,
     /// Non-empty when the card asks a question. The answer then has to be built
     /// from these questions, so a bare allow cannot resolve it -- see `answer`.
     questions: Vec<Question>,
@@ -73,6 +93,7 @@ impl PendingRequests {
         request_id: &str,
         viewer_id: u64,
         session_id: &str,
+        source: &str,
         questions: Vec<Question>,
         tool_input: Option<Value>,
     ) -> Receiver<Option<Decision>> {
@@ -83,11 +104,21 @@ impl PendingRequests {
                 sender,
                 viewer_id,
                 session_id: session_id.to_string(),
+                source: source.to_string(),
                 questions,
                 tool_input,
             },
         );
         receiver
+    }
+
+    /// Which CLI owns this parked request, when it is still parked.
+    ///
+    /// The daemon uses it to decide whether a "always allow" request can be
+    /// honoured with the CLI's native session-rule envelope; a source the daemon
+    /// has not verified degrades to a one-time allow rather than a fabricated rule.
+    pub fn source_of(&self, request_id: &str) -> Option<String> {
+        self.entries.get(request_id).map(|entry| entry.source.clone())
     }
 
     /// What the card is asking, when it is a question card. The daemon needs this
@@ -211,7 +242,7 @@ mod tests {
 
     /// A plain approve/deny card: no questions attached.
     fn park_plain(pending: &mut PendingRequests, id: &str, viewer: u64, session: &str) -> Receiver<Option<Decision>> {
-        pending.park(id, viewer, session, vec![], None)
+        pending.park(id, viewer, session, "claude", vec![], None)
     }
 
     fn question_card(pending: &mut PendingRequests, id: &str, viewer: u64, session: &str) -> Receiver<Option<Decision>> {
@@ -219,6 +250,7 @@ mod tests {
             id,
             viewer,
             session,
+            "claude",
             vec![Question {
                 header: "Color".into(),
                 question: "Red or blue?".into(),
@@ -291,6 +323,18 @@ mod tests {
             pending.question_of("r1").is_none(),
             "a permission card is not a question card"
         );
+    }
+
+    #[test]
+    fn a_session_rule_is_an_allow_that_carries_the_flag() {
+        let mut pending = PendingRequests::default();
+        let receiver = park_plain(&mut pending, "r1", 7, "s1");
+        assert_eq!(pending.source_of("r1").as_deref(), Some("claude"));
+        assert_eq!(pending.answer("r1", Decision::session_allow()).as_deref(), Some("s1"));
+        let got = await_decision(&receiver).unwrap();
+        assert_eq!(got.behavior, Behavior::Allow);
+        assert!(got.allow_session_rule, "the reply must carry the session-rule flag");
+        assert!(pending.source_of("r9").is_none(), "a gone request has no source");
     }
 
     #[test]

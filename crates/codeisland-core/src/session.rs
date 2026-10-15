@@ -219,11 +219,19 @@ pub enum ViewCommand {
     ///
     /// An empty `answers` on a question card is not an answer: the daemon refuses
     /// it rather than letting the tool run with questions still open.
+    ///
+    /// `session_rule` turns an `allow` into an "always allow this tool for the
+    /// rest of this session" -- the CLI's native session-scoped rule, not a
+    /// preference this island keeps. The daemon only honours it for Claude Code,
+    /// the one source whose reply envelope it has verified can carry the rule;
+    /// any other source degrades to a one-time allow.
     PermissionDecision {
         request_id: String,
         behavior: crate::protocol::Behavior,
         #[serde(default)]
         answers: Vec<AnswerChoice>,
+        #[serde(default)]
+        session_rule: bool,
     },
     /// "Bring me the terminal this session is running in."
     ///
@@ -939,6 +947,7 @@ mod permission_wire_tests {
             request_id: "r1".into(),
             behavior: Behavior::Allow,
             answers: Vec::new(),
+            session_rule: false,
         };
         let value: serde_json::Value = serde_json::to_value(&command).unwrap();
         assert_eq!(value["type"], "permission_decision");
@@ -953,8 +962,27 @@ mod permission_wire_tests {
                 request_id: "r2".into(),
                 behavior: Behavior::Deny,
                 answers: Vec::new(),
+                session_rule: false,
             }
         );
+
+        // An old client that never heard of session rules still parses: absent
+        // means false, so a stale shell cannot accidentally request one.
+        let old_client: ViewCommand =
+            serde_json::from_str(r#"{"type":"permission_decision","request_id":"r3","behavior":"allow"}"#)
+                .unwrap();
+        assert!(!matches!(
+            old_client,
+            ViewCommand::PermissionDecision { session_rule: true, .. }
+        ));
+        let with_rule: ViewCommand = serde_json::from_str(
+            r#"{"type":"permission_decision","request_id":"r4","behavior":"allow","session_rule":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            with_rule,
+            ViewCommand::PermissionDecision { session_rule: true, .. }
+        ));
     }
 
     #[test]

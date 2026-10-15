@@ -961,6 +961,51 @@ MouseArea {
                                     }
                                 }
                             }
+
+                            // 始终允许. Only on Claude Code cards: that is the one
+                            // source whose reply envelope is verified to carry the
+                            // session-scoped rule (updatedPermissions /
+                            // destination=session), so for any other source the
+                            // button would be a promise the daemon cannot keep.
+                            // One click approves *and* tells the CLI to stop asking
+                            // for this tool for the rest of the session.
+                            Rectangle {
+                                Layout.preferredWidth: 90
+                                Layout.preferredHeight: 28
+                                Layout.alignment: Qt.AlignVCenter
+                                radius: 8
+                                visible: cardRoot.source === "claude"
+                                color: alwaysArea.containsMouse ? "#1f3d2c" : "#14241a"
+                                border.width: 1
+                                border.color: "#3d8b52"
+                                Column {
+                                    anchors.centerIn: parent
+                                    spacing: 1
+                                    Text {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        text: "始终允许"
+                                        color: "#7bf3a0"
+                                        font.pixelSize: 12
+                                        font.bold: true
+                                    }
+                                    Text {
+                                        anchors.horizontalCenter: parent.horizontalCenter
+                                        text: "本会话"
+                                        color: "#4a6b56"
+                                        font.pixelSize: 8
+                                    }
+                                }
+                                MouseArea {
+                                    id: alwaysArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        console.log("always allow clicked, requestId=" + requestId)
+                                        daemon.decideAlways(requestId)
+                                    }
+                                }
+                            }
                         }
                     }
                 }
