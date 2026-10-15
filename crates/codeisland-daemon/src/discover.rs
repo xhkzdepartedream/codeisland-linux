@@ -92,6 +92,11 @@ pub struct Discovered {
     /// codex: the trailing thread uuid). That is what lets a later hook event merge into the
     /// same row instead of opening a second one.
     pub session_id: String,
+    /// The conversation's own title, when the harness stated one: codex's thread name
+    /// from `session_index.jsonl`, claude's `custom-title`/`ai-title` rows, or the first
+    /// user prompt as the universal fallback. The row leads with this instead of the
+    /// project label when present -- see `transcript_title`.
+    pub title: Option<String>,
     pub cwd: String,
     pub transcript: PathBuf,
     /// The checked-out git branch in `cwd`, when it could be read from disk. Kept on the row
@@ -209,6 +214,153 @@ pub fn session_id_of(path: &Path) -> Option<String> {
     Some(groups[groups.len() - 5..].join("-"))
 }
 
+/// Thread names codex itself wrote, from `session_index.jsonl` under its home.
+///
+/// One line per thread update: `{"id":…,"thread_name":…,"updated_at":…}`. The same
+/// thread can appear several times; the file is append-ordered, so the last line
+/// for an id wins -- upstream compares `updated_at` timestamps to the same effect.
+/// This is the one title source that needs no transcript read at all.
+pub fn codex_thread_names(codex_home: &Path) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(index) = read_head(&codex_home.join("session_index.jsonl"), 4 * 1024 * 1024) else {
+        return out;
+    };
+    for line in index.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let (Some(id), Some(name)) = (
+            value.get("id").and_then(|v| v.as_str()),
+            value.get("thread_name").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let name = name.trim();
+        if id.is_empty() || name.is_empty() {
+            continue;
+        }
+        out.insert(id.to_string(), single_line(name));
+    }
+    out
+}
+
+/// The title of the conversation a transcript holds, when the harness stated one.
+///
+/// Sources in the order they are trusted (upstream's `SessionTitleStore` reads the
+/// same two, custom first):
+///
+/// 1. **A title the harness wrote down.** Claude Code appends
+///    `{"type":"custom-title","customTitle":…}` / `ai-title` rows (measured on
+///    this machine); codex keeps thread names in `session_index.jsonl` instead.
+/// 2. **The first user prompt.** The user's own words are the most literal
+///    "what is this conversation about" that every harness records. Measured
+///    shapes: claude `type:"user"` with string content, codex `response_item`
+///    message role user `input_text`, pi `message` role user text blocks.
+/// 3. Nothing -- a transcript with neither (claude writes the first prompt
+///    lazily; a brand-new agent has written nothing) has no title, and the row
+///    keeps its project label.
+///
+/// Claude's synthetic rows (`<local-command-caveat>`, `<command-name>`, …) are
+/// skipped: they are terminal plumbing, not conversation.
+pub fn transcript_title(path: &Path) -> Option<String> {
+    let head = read_head(path, 128 * 1024)?;
+    let tail = read_tail(path, 64 * 1024).unwrap_or_default();
+
+    let mut custom: Option<String> = None;
+    let mut ai: Option<String> = None;
+    let mut first_prompt: Option<String> = None;
+    for line in head.lines().chain(tail.lines()) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("custom-title") => {
+                if let Some(text) = value.get("customTitle").and_then(|v| v.as_str()) {
+                    custom = Some(single_line(text));
+                }
+                continue;
+            }
+            Some("ai-title") => {
+                if let Some(text) = value.get("aiTitle").and_then(|v| v.as_str()) {
+                    ai = Some(single_line(text));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if first_prompt.is_none() {
+            first_prompt = first_user_text(&value);
+        }
+    }
+    custom.or(ai).or(first_prompt).map(|text| truncate(&text, 80))
+}
+
+/// The first user prompt in one transcript row, per harness, or `None`.
+fn first_user_text(value: &serde_json::Value) -> Option<String> {
+    match value.get("type").and_then(|t| t.as_str()) {
+        // claude: {"type":"user","message":{"role":"user","content":"…"}}
+        Some("user") => {
+            let text = message_text(value.get("message"))?;
+            // Claude Code writes terminal plumbing into user rows before the first real
+            // prompt; those are not conversation and must not become the title.
+            const CAVEATS: [&str; 4] = [
+                "<local-command-caveat>",
+                "<command-name>",
+                "<bash-input>",
+                "<system-reminder>",
+            ];
+            if CAVEATS.iter().any(|caveat| text.starts_with(caveat)) {
+                return None;
+            }
+            Some(text)
+        }
+        // codex: {"type":"response_item","payload":{"type":"message","role":"user",
+        //         "content":[{"type":"input_text","text":"…"}]}}
+        Some("response_item") => {
+            let payload = value.get("payload")?;
+            if payload.get("type").and_then(|t| t.as_str()) != Some("message")
+                || payload.get("role").and_then(|r| r.as_str()) != Some("user")
+            {
+                return None;
+            }
+            let blocks = payload.get("content")?.as_array()?;
+            let text = blocks
+                .iter()
+                .find_map(|block| block.get("text").and_then(|t| t.as_str()))?;
+            Some(single_line(text))
+        }
+        // pi: {"type":"message","message":{"role":"user","content":[{"type":"text","text":"…"}]}}
+        Some("message") => {
+            let message = value.get("message")?;
+            if message.get("role").and_then(|r| r.as_str()) != Some("user") {
+                return None;
+            }
+            message_text(Some(message))
+        }
+        _ => None,
+    }
+}
+
+/// The text of one message row: string content as-is, or the first text block
+/// of array content. Shared by the title and detail readers.
+fn message_text(message: Option<&serde_json::Value>) -> Option<String> {
+    let content = message?.get("content")?;
+    if let Some(text) = content.as_str() {
+        return Some(single_line(text));
+    }
+    let blocks = content.as_array()?;
+    let text = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("text"))
+        .find_map(|block| block.get("text").and_then(|t| t.as_str()))?;
+    Some(single_line(text))
+}
+
+/// Collapse to one line: a card title or detail line never wraps.
+fn single_line(text: &str) -> String {
+    text.trim().replace(['\n', '\r'], " ")
+}
+
 /// Live agent processes, identified by argv and located by their cwd.
 pub fn agent_processes() -> Vec<AgentProcess> {
     let mut out = Vec::new();
@@ -303,13 +455,7 @@ fn archive_roots(home: &Path) -> BTreeMap<Harness, PathBuf> {
         home.join(".claude").join("projects")
     };
     roots.insert(Harness::Claude, claude);
-    roots.insert(
-        Harness::Codex,
-        std::env::var("CODEX_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| home.join(".codex"))
-            .join("sessions"),
-    );
+    roots.insert(Harness::Codex, codex_home(home).join("sessions"));
     roots.insert(Harness::Pi, home.join(".pi").join("agent").join("sessions"));
     roots
 }
@@ -378,9 +524,17 @@ pub fn discover(
     max_age_ms: u64,
     probe_limit: usize,
     cwd_cache: &mut std::collections::HashMap<PathBuf, (u64, Option<String>)>,
+    title_cache: &mut std::collections::HashMap<PathBuf, (u64, Option<String>)>,
 ) -> Vec<Discovered> {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    discover_in(&home, agent_processes(), now_ms, max_age_ms, probe_limit, cwd_cache)
+    discover_in(&home, agent_processes(), now_ms, max_age_ms, probe_limit, cwd_cache, title_cache)
+}
+
+/// Where codex's home is, honouring `CODEX_HOME` exactly like `archive_roots` does.
+fn codex_home(home: &Path) -> PathBuf {
+    std::env::var("CODEX_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home.join(".codex"))
 }
 
 fn millis_of(meta: &fs::Metadata) -> u64 {
@@ -400,6 +554,7 @@ pub fn discover_in(
     max_age_ms: u64,
     probe_limit: usize,
     cwd_cache: &mut std::collections::HashMap<PathBuf, (u64, Option<String>)>,
+    title_cache: &mut std::collections::HashMap<PathBuf, (u64, Option<String>)>,
 ) -> Vec<Discovered> {
     let roots = archive_roots(home);
     let mut out: Vec<Discovered> = Vec::new();
@@ -449,14 +604,22 @@ pub fn discover_in(
         // but one of them.
         let take = probe_limit;
 
-        // Parse once: the cwd and id are needed by both passes, and the file walk is the
-        // expensive part.
+        // Parse once: the cwd, id and title are needed by both passes, and the file walk
+        // is the expensive part.
         struct Entry {
             path: PathBuf,
             cwd: String,
             session_id: String,
+            title: Option<String>,
             last_write_ms: u64,
         }
+        // Codex names its threads in a small index beside the archives; read it once per
+        // scan (it is a few KB) rather than per transcript.
+        let codex_names = if *harness == Harness::Codex {
+            codex_thread_names(&codex_home(home))
+        } else {
+            BTreeMap::new()
+        };
         let mut entries: Vec<Entry> = Vec::new();
         for path in candidates(root, take) {
             if claimed.contains(&path) {
@@ -476,13 +639,29 @@ pub fn discover_in(
                     found
                 }
             };
-            let (Some(cwd), Some(session_id)) = (cwd, session_id_of(&path)) else {
+            let session_id = session_id_of(&path);
+            // The title *can* appear later -- a first prompt lands with the first turn, a
+            // claude custom-title mid-session -- so the cache re-extracts whenever the file
+            // has grown, and only holds a settled value for a file that stopped moving.
+            let title = match title_cache.get(&path) {
+                Some((cached_size, cached_title)) if *cached_size == size => cached_title.clone(),
+                _ => {
+                    let found = codex_names
+                        .get(session_id.as_deref().unwrap_or(""))
+                        .cloned()
+                        .or_else(|| transcript_title(&path));
+                    title_cache.insert(path.clone(), (size, found.clone()));
+                    found
+                }
+            };
+            let (Some(cwd), Some(session_id)) = (cwd, session_id) else {
                 continue;
             };
             entries.push(Entry {
                 path,
                 cwd,
                 session_id,
+                title,
                 last_write_ms: millis_of(&meta),
             });
         }
@@ -593,6 +772,7 @@ pub fn discover_in(
             out.push(Discovered {
                 harness: *harness,
                 session_id: entry.session_id.clone(),
+                title: entry.title.clone(),
                 cwd: entry.cwd.clone(),
                 transcript: entry.path.clone(),
                 branch: codeisland_core::git::head_branch(std::path::Path::new(&entry.cwd)),
@@ -808,15 +988,29 @@ pub fn child_parent(path: &Path) -> Option<String> {
 
 /// Read the tail looking for the last thing the harness recorded, used only for a one-line
 /// detail on a discovered row. Bounded, and never trusted to say anything about waiting.
+///
+/// Two passes, newest first, both skipping the harness's bookkeeping rows (codex's
+/// `event_msg` token counters and `token_usage_record`s -- the turn lifecycle they
+/// carry is the status capsule's business, and their type name was once the whole
+/// fallback: the row read "存档 · event_msg", which says nothing at all):
+///
+/// 1. The last tool call -- "what is it doing" is the question the row is answering,
+///    and a tool call is the most literal answer the file holds.
+/// 2. The last thing anybody said -- the newest message text, which for a finished
+///    turn is the reply itself. Better than silence, better than a type name.
+///
+/// The window is 64 KB because the measured file had its last tool call 9 rows and
+/// 16+ KB from the end: big reasoning and reply rows pushed it out of a 16 KB tail.
 pub fn tail_hint(path: &Path) -> Option<String> {
-    let tail = read_tail(path, 16 * 1024)?;
-    // Newest first, and a tool call beats prose: "what is it doing" is the question the row is
-    // answering, and a tool call is the most literal answer the file holds. The three shapes
-    // below are the measured ones (see the module docs).
+    let tail = read_tail(path, 64 * 1024)?;
+    // Newest first, and a tool call beats prose.
     for line in tail.lines().rev() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        if is_noise_row(&value) {
+            continue;
+        }
         if let Some(hint) = tool_call_hint(&value) {
             return Some(hint);
         }
@@ -825,22 +1019,43 @@ pub fn tail_hint(path: &Path) -> Option<String> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        if let Some(text) = value
-            .get("message")
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .map(str::to_string)
-        {
+        if is_noise_row(&value) {
+            continue;
+        }
+        // codex: response_item message text (assistant reply or user prompt).
+        if value.get("type").and_then(|t| t.as_str()) == Some("response_item") {
+            if let Some(payload) = value.get("payload") {
+                if payload.get("type").and_then(|t| t.as_str()) == Some("message") {
+                    if let Some(blocks) = payload.get("content").and_then(|c| c.as_array()) {
+                        if let Some(text) = blocks
+                            .iter()
+                            .find_map(|block| block.get("text").and_then(|t| t.as_str()))
+                        {
+                            return Some(truncate(&single_line(text), 120));
+                        }
+                    }
+                }
+            }
+        }
+        // pi / claude: message rows, string or text-block content.
+        if let Some(text) = message_text(value.get("message")) {
             return Some(truncate(&text, 120));
         }
-        if let Some(text) = value.get("text").and_then(|t| t.as_str()).map(str::to_string) {
-            return Some(truncate(&text, 120));
-        }
-        if let Some(kind) = value.get("type").and_then(|t| t.as_str()) {
-            return Some(kind.to_string());
+        if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
+            return Some(truncate(&single_line(text), 120));
         }
     }
     None
+}
+
+/// Bookkeeping rows that must never become a row's one-line detail: they carry
+/// no answer to "what is it doing", and their type name as a fallback produced
+/// the measured "存档 · event_msg" -- a detail line that says nothing.
+fn is_noise_row(value: &serde_json::Value) -> bool {
+    matches!(
+        value.get("type").and_then(|t| t.as_str()),
+        Some("event_msg") | Some("token_usage_record")
+    )
 }
 
 /// The last tool call in one transcript row, as a one-line "what is it doing".
@@ -1004,7 +1219,8 @@ mod tests {
         }];
         let home = root.clone();
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&home, processes, now_ms(), 600_000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&home, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
         assert_eq!(found.len(), 1, "exactly one session should match the cwd");
         assert_eq!(found[0].transcript, here);
         assert_ne!(found[0].transcript, other);
@@ -1036,7 +1252,8 @@ mod tests {
         }];
         let home = root.clone();
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&home, processes, now_ms(), 600_000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&home, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
         assert_eq!(found.len(), 1, "the running session must be visible: {found:?}");
         assert_eq!(found[0].transcript, transcript);
         assert_eq!(found[0].cwd, "/home/u/pi-sessions/agent universe");
@@ -1063,7 +1280,8 @@ mod tests {
             started_ms: at, // the new agent opened *after* the old session ended
         }];
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, at + 60_000, 2 * 60 * 60 * 1000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, at + 60_000, 2 * 60 * 60 * 1000, 50, &mut cache, &mut titles);
         assert!(
             found.is_empty(),
             "an empty new agent must not inherit the previous session: {found:?}"
@@ -1088,7 +1306,8 @@ mod tests {
             started_ms: at - 60_000, // alive before the last write
         }];
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, at + 90 * 60_000, 2 * 60 * 60 * 1000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, at + 90 * 60_000, 2 * 60 * 60 * 1000, 50, &mut cache, &mut titles);
         assert_eq!(found.len(), 1, "a parked agent is still a session: {found:?}");
         assert_eq!(found[0].transcript, transcript);
         fs::remove_dir_all(&root).ok();
@@ -1110,7 +1329,8 @@ mod tests {
             AgentProcess { harness: Harness::Pi, pid: 2, cwd: PathBuf::from("/home/xhkz"), started_ms: at - 60_000 },
         ];
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, at, 2 * 60 * 60 * 1000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, at, 2 * 60 * 60 * 1000, 50, &mut cache, &mut titles);
         assert_eq!(found.len(), 1, "the older process can still own it: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
@@ -1132,7 +1352,8 @@ mod tests {
             started_ms: at, // opened after the session ended
         }];
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, at + 60_000, 2 * 60 * 60 * 1000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, at + 60_000, 2 * 60 * 60 * 1000, 50, &mut cache, &mut titles);
         assert!(found.is_empty(), "the directory match must not resurrect: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
@@ -1152,7 +1373,8 @@ mod tests {
             started_ms: 0, // unknown
         }];
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
         assert_eq!(found.len(), 1, "no bound is applied when the start is unknown: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
@@ -1164,7 +1386,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("ci-discover-idle-{}", now_ms()));
         fixture(&root, Harness::Pi, "/tmp/proj", "fresh", "{}");
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&root, Vec::new(), now_ms(), 600_000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, Vec::new(), now_ms(), 600_000, 50, &mut cache, &mut titles);
         assert!(found.is_empty(), "no process means no session: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
@@ -1188,7 +1411,8 @@ mod tests {
             started_ms: now_ms() - 3_600_000,
         }];
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, an_hour_later, 60_000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, an_hour_later, 60_000, 50, &mut cache, &mut titles);
         assert!(found.is_empty(), "an hour-old transcript is not a live session: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
@@ -1208,7 +1432,8 @@ mod tests {
         }];
         let an_hour_later = now_ms() + 3_600_000;
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, an_hour_later, 60_000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, an_hour_later, 60_000, 50, &mut cache, &mut titles);
         assert_eq!(found.len(), 1, "a quiet session with a live process is still a session");
         assert_eq!(found[0].pid, Some(1));
         fs::remove_dir_all(&root).ok();
@@ -1299,7 +1524,8 @@ mod tests {
             AgentProcess { harness: Harness::Codex, pid: 11, cwd: PathBuf::from("/tmp/proj"), started_ms: now_ms() - 60_000 },
         ];
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
         let ids: Vec<&str> = found.iter().map(|d| d.session_id.as_str()).collect();
         assert!(ids.contains(&parent_id), "the parent must be shown: {ids:?}");
         assert!(!ids.contains(&child_id), "the subagent must fold into it: {ids:?}");
@@ -1325,7 +1551,8 @@ mod tests {
         ).unwrap();
         let processes = vec![AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj"), started_ms: now_ms() - 60_000 }];
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
         assert_eq!(found.len(), 1, "an orphan subagent is still a live session: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
@@ -1442,7 +1669,8 @@ mod tests {
 
         let processes = vec![AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj"), started_ms: now_ms() - 60_000 }];
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
         assert_eq!(found.len(), 1, "one thread is one row: {found:?}");
         assert_eq!(found[0].transcript, newer, "the live rollout must win, not the stale one");
         let hint = tail_hint(&found[0].transcript).unwrap();
@@ -1509,7 +1737,8 @@ mod tests {
             },
         ];
         let mut cache = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
         assert_eq!(found.len(), 2, "two sessions in one directory are two rows: {found:?}");
         let transcripts: Vec<PathBuf> = found.iter().map(|d| d.transcript.clone()).collect();
         assert_ne!(transcripts[0], transcripts[1], "one transcript claimed twice");
@@ -1518,6 +1747,7 @@ mod tests {
 
         // A single process in that same directory takes exactly one row -- the newest.
         let mut cache2 = std::collections::HashMap::new();
+        let mut titles2 = std::collections::HashMap::new();
         let alone = discover_in(
             &root,
             vec![AgentProcess {
@@ -1530,8 +1760,161 @@ mod tests {
             600_000,
             50,
             &mut cache2,
+            &mut titles2,
         );
         assert_eq!(alone.len(), 1, "one process must not invent two sessions: {alone:?}");
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn titles_come_from_each_harnesss_own_record() {
+        // Three measured title sources, one test: codex's `session_index.jsonl`
+        // thread name, claude's `custom-title` row, and the first user prompt
+        // for pi -- which upstream deliberately does not support, and where the
+        // user's own words are the only source there is.
+        let root = std::env::temp_dir().join(format!("ci-discover-title-{}", now_ms()));
+        let thread = "01a139b5-e5a5-77b0-a481-a86d0b4150b9";
+
+        // codex: the index names the thread; the transcript need not be read.
+        let codex_dir = root.join(".codex/sessions");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(
+            codex_dir.join(format!("rollout-2026-10-15T13-11-30-{thread}.jsonl")),
+            format!("{}\n", serde_json::json!({"type":"session_meta","payload":{"cwd":"/tmp/p","id":thread}})),
+        ).unwrap();
+        fs::write(
+            root.join(".codex/session_index.jsonl"),
+            format!("{}\n{}\n", serde_json::json!({"id":"unrelated","thread_name":"别的会话"}),
+                serde_json::json!({"id":thread,"thread_name":"handoff 看一下这个东西"})),
+        ).unwrap();
+
+        // claude: a custom-title row beats the first prompt. Real claude user rows
+        // carry the cwd alongside the message, which is where discovery reads it.
+        let claude_dir = root.join(".claude/projects/-tmp-p");
+        fs::create_dir_all(&claude_dir).unwrap();
+        fs::write(
+            claude_dir.join("c1.jsonl"),
+            format!("{}\n{}\n",
+                serde_json::json!({"type":"user","cwd":"/tmp/p","message":{"role":"user","content":"被标题盖住的首条提问"}}),
+                serde_json::json!({"type":"custom-title","customTitle":"fix-doc-path-batch-edit"})),
+        ).unwrap();
+
+        // pi: no title record exists, so the first user prompt is the title. The
+        // session row carries the cwd, as pi writes it.
+        let pi_dir = root.join(".pi/agent/sessions/--tmp-p--");
+        fs::create_dir_all(&pi_dir).unwrap();
+        fs::write(
+            pi_dir.join("p1.jsonl"),
+            format!("{}\n{}\n", serde_json::json!({"type":"session","version":3,"id":"p1","cwd":"/tmp/p"}),
+                serde_json::json!({"type":"message","message":{"role":"user",
+                "content":[{"type":"text","text":"你看一下kcu这个mcp如何接入\n换行也应该被压平"}]}})),
+        ).unwrap();
+
+        let processes = vec![
+            AgentProcess { harness: Harness::Codex, pid: 1, cwd: PathBuf::from("/tmp/p"), started_ms: now_ms() - 60_000 },
+            AgentProcess { harness: Harness::Claude, pid: 2, cwd: PathBuf::from("/tmp/p"), started_ms: now_ms() - 60_000 },
+            AgentProcess { harness: Harness::Pi, pid: 3, cwd: PathBuf::from("/home/u"), started_ms: now_ms() - 60_000 },
+        ];
+        let mut cache = std::collections::HashMap::new();
+        let mut titles = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
+        let title_of = |harness: Harness| {
+            found
+                .iter()
+                .find(|d| d.harness == harness)
+                .and_then(|d| d.title.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(title_of(Harness::Codex), "handoff 看一下这个东西", "codex reads its own index");
+        assert_eq!(title_of(Harness::Claude), "fix-doc-path-batch-edit", "a written title beats the prompt");
+        assert_eq!(title_of(Harness::Pi), "你看一下kcu这个mcp如何接入 换行也应该被压平", "pi falls back to the first prompt, one line");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_claude_prompt_that_is_terminal_plumbing_is_not_a_title() {
+        // Claude Code writes synthetic user rows (`<local-command-caveat>`, …)
+        // before the first real prompt. Measured on this machine: the first
+        // user row of a transcript is often exactly that. Those are not
+        // conversation, and as titles they would be pure noise.
+        let dir = std::env::temp_dir().join(format!("ci-discover-caveat-{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        fs::write(
+            &path,
+            format!("{}\n{}\n",
+                serde_json::json!({"type":"user","message":{"role":"user",
+                    "content":"<local-command-caveat>The command below was run directly…"}}),
+                serde_json::json!({"type":"user","message":{"role":"user","content":"真正的第一个提问"}})),
+        ).unwrap();
+        assert_eq!(
+            transcript_title(&path).as_deref(),
+            Some("真正的第一个提问"),
+            "caveat rows must be skipped, not titled"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_detail_line_skips_noise_and_reports_the_last_real_activity() {
+        // The measured complaint: a row whose detail read "存档 · event_msg" --
+        // the *type name* of codex's bookkeeping rows, which says nothing. The
+        // last real activity was a tool call that sat more than 16 KB from the
+        // end behind big reasoning/reply rows and a wall of counter rows, so
+        // neither pass of the old reader reached it.
+        let dir = std::env::temp_dir().join(format!("ci-discover-detail-{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+
+        let big_reply = "x".repeat(20 * 1024); // pushes the tool call past a 16 KB tail
+        let noisy = dir.join("noisy.jsonl");
+        fs::write(
+            &noisy,
+            format!("{}\n{}\n{}\n{}\n{}\n",
+                serde_json::json!({"type":"response_item","payload":{"type":"function_call",
+                    "name":"exec_command","arguments":"{\"cmd\":\"python train.py\"}"}}),
+                serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+                    "content":[{"type":"output_text","text":big_reply}]}}),
+                serde_json::json!({"type":"token_usage_record"}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count"}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"item_completed"}})),
+        ).unwrap();
+        let hint = tail_hint(&noisy).expect("the tool call is the answer");
+        assert!(hint.contains("exec_command"), "names the tool behind the noise: {hint}");
+        assert!(hint.contains("python train.py"), "and what it runs: {hint}");
+
+        // No tool call at all: the last reply text is the detail, never a type name.
+        let done = dir.join("done.jsonl");
+        fs::write(
+            &done,
+            format!("{}\n{}\n{}\n",
+                serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant",
+                    "content":[{"type":"output_text","text":"已按规范完成整理，并提交。"}]}}),
+                serde_json::json!({"type":"token_usage_record"}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"task_complete"}})),
+        ).unwrap();
+        let hint = tail_hint(&done).expect("the last reply is the answer");
+        assert!(hint.contains("已按规范完成整理"), "the reply is the detail: {hint}");
+
+        // Only bookkeeping rows: no detail at all, rather than "event_msg".
+        let bare = dir.join("bare.jsonl");
+        fs::write(
+            &bare,
+            format!("{}\n", serde_json::json!({"type":"event_msg","payload":{"type":"token_count"}})),
+        ).unwrap();
+        assert!(tail_hint(&bare).is_none(), "noise alone must not become a detail line");
+
+        // pi message rows still work: text blocks are readable both ways.
+        let pi = dir.join("pi.jsonl");
+        fs::write(
+            &pi,
+            format!("{}\n{}\n",
+                serde_json::json!({"type":"message","message":{"role":"assistant",
+                    "content":[{"type":"text","text":"先看配置再改代码。"}]}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"item_completed"}})),
+        ).unwrap();
+        let hint = tail_hint(&pi).expect("pi text is readable");
+        assert!(hint.contains("先看配置再改代码"), "pi message text: {hint}");
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

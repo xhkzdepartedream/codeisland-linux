@@ -23,6 +23,8 @@ QVariant SessionsModel::data(const QModelIndex &index, int role) const
         return row.id;
     case SourceRole:
         return row.source;
+    case TitleRole:
+        return row.title;
     case StatusRole:
         return row.status;
     case CwdRole:
@@ -52,6 +54,7 @@ QHash<int, QByteArray> SessionsModel::roleNames() const
     return {
         {IdRole, "sessionId"},
         {SourceRole, "source"},
+        {TitleRole, "title"},
         {StatusRole, "status"},
         {CwdRole, "cwd"},
         {ProjectRole, "project"},
@@ -75,6 +78,7 @@ void SessionsModel::applyUpsert(const QVariantMap &session)
     SessionRow row;
     row.id = id;
     row.source = session.value(QStringLiteral("source")).toString();
+    row.title = session.value(QStringLiteral("title")).toString();
     row.status = session.value(QStringLiteral("status")).toString();
     row.cwd = session.value(QStringLiteral("cwd")).toString();
     row.detail = session.value(QStringLiteral("detail")).toString();
@@ -133,6 +137,10 @@ void SessionsModel::applySnapshot(const QVariantList &sessions)
         SessionRow row;
         row.id = map.value(QStringLiteral("id")).toString();
         row.source = map.value(QStringLiteral("source")).toString();
+        // The title arrives on the same field in a snapshot as in an upsert; missing
+        // this left a freshly connected island showing project labels until the next
+        // scan happened to re-broadcast a title change that had already happened.
+        row.title = map.value(QStringLiteral("title")).toString();
         row.status = map.value(QStringLiteral("status")).toString();
         row.cwd = map.value(QStringLiteral("cwd")).toString();
         row.detail = map.value(QStringLiteral("detail")).toString();

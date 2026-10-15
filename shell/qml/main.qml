@@ -613,6 +613,7 @@ delegate: Rectangle {
                     required property int index
                     required property string sessionId
                     required property string source
+                    required property string title
                     required property string origin
                     required property string status
                     required property string project
@@ -701,7 +702,14 @@ delegate: Rectangle {
                                 spacing: 6
                                 Text {
                                     Layout.fillWidth: true
-                                    text: project
+                                    // The conversation's own title when the harness
+                                    // stated one (codex thread name, claude
+                                    // custom-title, first user prompt); the project
+                                    // folder otherwise. Upstream leads with the folder
+                                    // and trails the title -- this island has one
+                                    // line, so the title wins and the folder is the
+                                    // fallback.
+                                    text: title.length > 0 ? title : project
                                     color: "#f2f2f2"
                                     font.pixelSize: 14
                                     font.bold: true

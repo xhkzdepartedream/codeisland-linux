@@ -118,7 +118,8 @@ fn discover_once() {
         );
     }
     let mut cache = HashMap::new();
-    let found = discover::discover(now, DISCOVER_MAX_AGE_MS, DISCOVER_PROBE, &mut cache);
+    let mut titles = HashMap::new();
+    let found = discover::discover(now, DISCOVER_MAX_AGE_MS, DISCOVER_PROBE, &mut cache, &mut titles);
     println!("codeisland-daemon: 配上存档的会话 {} 个", found.len());
     for item in &found {
         let liveness = match discover::liveness(item.last_write_ms, now, DISCOVER_ACTIVE_MS) {
@@ -130,7 +131,7 @@ fn discover_once() {
             item.harness.as_str(),
             item.session_id,
             liveness,
-            item.cwd,
+            item.title.clone().unwrap_or_else(|| item.cwd.clone()),
             (now.saturating_sub(item.last_write_ms) / 1000),
             item.transcript.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
         );
@@ -1036,8 +1037,12 @@ fn spawn_discovery(shared: Arc<Shared>) {
         .name("codeisland-discover".to_string())
         .spawn(move || {
             let mut cwd_cache: HashMap<std::path::PathBuf, (u64, Option<String>)> = HashMap::new();
+            // Same shape as the cwd cache, for titles: re-extracted when a file has
+            // grown (a first prompt or a claude custom-title can appear mid-session),
+            // settled once the file stops moving.
+            let mut title_cache: HashMap<std::path::PathBuf, (u64, Option<String>)> = HashMap::new();
             loop {
-                scan_once(&shared, &mut cwd_cache);
+                scan_once(&shared, &mut cwd_cache, &mut title_cache);
                 std::thread::sleep(DISCOVER_INTERVAL);
             }
         });
@@ -1049,9 +1054,10 @@ fn spawn_discovery(shared: Arc<Shared>) {
 fn scan_once(
     shared: &Arc<Shared>,
     cwd_cache: &mut HashMap<std::path::PathBuf, (u64, Option<String>)>,
+    title_cache: &mut HashMap<std::path::PathBuf, (u64, Option<String>)>,
 ) {
     let now = now_ms();
-    let found = discover::discover(now, DISCOVER_MAX_AGE_MS, DISCOVER_PROBE, cwd_cache);
+    let found = discover::discover(now, DISCOVER_MAX_AGE_MS, DISCOVER_PROBE, cwd_cache, title_cache);
     if std::env::var_os("CODEISLAND_DEBUG_DISCOVERY").is_some() {
         // Off by default: this runs every few seconds and a daemon that chats in its own log
         // is a daemon nobody reads. When it IS on, "0 rows" must be explainable from the line
@@ -1118,6 +1124,12 @@ fn scan_once(
             stated.is_some(),
             now,
         ) {
+            updates.push(update);
+        }
+        // The conversation's own title, for rows of either origin: hook events
+        // carry a cwd but never a title, so the transcript is the only source
+        // and this scan is what reads it. `None` leaves any earlier title alone.
+        if let Some(update) = registry.set_title(&item.session_id, item.title.clone()) {
             updates.push(update);
         }
     }

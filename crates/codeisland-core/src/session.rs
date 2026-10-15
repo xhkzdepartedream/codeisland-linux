@@ -90,6 +90,11 @@ impl SessionStatus {
 pub struct Session {
     pub id: String,
     pub source: String,
+    /// The conversation's own title, when the harness stated one. The row leads
+    /// with this and falls back to the project label when absent -- see
+    /// `SessionTitleStore.swift` upstream, which reads the same sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub status: SessionStatus,
     /// Directory the agent is working in; the island shows its last component as
     /// the session's human label.
@@ -280,6 +285,7 @@ impl SessionRegistry {
             Session {
                 id: id.clone(),
                 source: source.clone(),
+                title: None,
                 status: SessionStatus::Idle,
                 cwd: None,
                 branch: None,
@@ -401,6 +407,7 @@ impl SessionRegistry {
         let session = Session {
             id: id.to_string(),
             source: source.to_string(),
+            title: None,
             status,
             cwd: Some(cwd.to_string()),
             branch,
@@ -489,6 +496,26 @@ impl SessionRegistry {
                 ViewUpdate::SessionRemove { id }
             })
             .collect()
+    }
+
+    /// Give a session its conversation title, from whatever its transcript states.
+    ///
+    /// Applies to rows of both origins: hook events carry a cwd but never a title,
+    /// so the transcript is the only source, and the discovery scan is what reads
+    /// it. `None` never clears -- a transient read failure must not blank a row
+    /// that had a title a second ago. `last_event_ms` is deliberately untouched:
+    /// a title arriving late is not activity, and moving it would reorder rows
+    /// and reset the staleness clock.
+    pub fn set_title(&mut self, id: &str, title: Option<String>) -> Option<ViewUpdate> {
+        let Some(title) = title else { return None };
+        let session = self.sessions.get_mut(id)?;
+        if session.title.as_deref() == Some(title.as_str()) {
+            return None;
+        }
+        session.title = Some(title);
+        Some(ViewUpdate::SessionUpsert {
+            session: session.clone(),
+        })
     }
 
     pub fn release_request(&mut self, session_id: &str) -> Option<ViewUpdate> {
@@ -992,6 +1019,35 @@ mod permission_wire_tests {
             1,
             "the sweep fires just past the caller's window"
         );
+    }
+
+    #[test]
+    fn a_title_arrives_late_without_pretending_to_be_activity() {
+        // The discovery scan reads the transcript on its own clock, so a title
+        // lands seconds after the row exists. It must reach both origins, must
+        // not bump last_event_ms (that would reorder rows and reset the staleness
+        // clock), and must not re-broadcast once set.
+        let mut reg = SessionRegistry::new();
+        reg.apply(&hook_event("SessionStart", "hooked"), 1_000);
+        reg.register_discovered("disc", "pi", "/tmp/p", None, SessionStatus::Working, None, true, 2_000);
+
+        let update = reg.set_title("hooked", Some("修复登录页".into())).expect("a title is an update");
+        match update {
+            ViewUpdate::SessionUpsert { session } => {
+                assert_eq!(session.title.as_deref(), Some("修复登录页"));
+                assert_eq!(session.last_event_ms, 1_000, "a title is not activity");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(reg.set_title("hooked", Some("修复登录页".into())).is_none(), "unchanged title, no update");
+        reg.set_title("disc", Some("看kcu接入".into()));
+        assert_eq!(reg.get("disc").unwrap().title.as_deref(), Some("看kcu接入"));
+
+        // None never clears: a transient read failure must not blank a titled row.
+        reg.set_title("hooked", None);
+        assert_eq!(reg.get("hooked").unwrap().title.as_deref(), Some("修复登录页"));
+        // A missing session is simply nothing to do.
+        assert!(reg.set_title("nope", Some("x".into())).is_none());
     }
 
 }

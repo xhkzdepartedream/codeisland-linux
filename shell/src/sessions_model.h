@@ -16,6 +16,11 @@
 struct SessionRow {
     QString id;
     QString source;
+    /// The conversation's own title, when the harness stated one (codex thread
+    /// name, claude custom-title, or the first user prompt). The card leads with
+    /// it and falls back to the project label when empty -- which is why it is
+    /// kept as a plain string instead of an optional.
+    QString title;
     QString status;
     QString cwd;
     QString detail;
@@ -47,6 +52,7 @@ public:
     enum Roles {
         IdRole = Qt::UserRole + 1,
         SourceRole,
+        TitleRole,
         StatusRole,
         CwdRole,
         ProjectRole,
