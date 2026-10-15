@@ -58,7 +58,7 @@ QHash<int, QByteArray> SessionsModel::roleNames() const
         {DetailRole, "detail"},
         {OriginRole, "origin"},
         {BranchRole, "branch"},
-        {StatedRole, "status_stated"},
+        {StatedRole, "statusStated"},
         {ToolCallsRole, "toolCalls"},
         {LastEventMsRole, "lastEventMs"},
         {StartedMsRole, "startedMs"},
