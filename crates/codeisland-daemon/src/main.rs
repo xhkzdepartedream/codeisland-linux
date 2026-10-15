@@ -65,6 +65,10 @@ struct Shared {
     /// `CODEISLAND_NOTIFY_ON_STOP`; an atomic so no event path re-reads the
     /// environment, and so the value in the log matches the value in use.
     notify_on_stop: Arc<AtomicBool>,
+    /// How long a hook row survives after its last event when nothing else
+    /// speaks for it, from `CODEISLAND_HOOK_STALE_MS` or the 10-minute default.
+    /// Resolved once at startup for the same reason as `notify_on_stop`.
+    hook_stale_ms: u64,
     next_request_id: AtomicU64,
 }
 
@@ -80,6 +84,11 @@ impl Shared {
             notify_on_stop: Arc::new(AtomicBool::new(notify::parse_flag(
                 std::env::var_os(notify::ON_STOP_ENV).as_deref().and_then(|v| v.to_str()),
             ))),
+            hook_stale_ms: std::env::var("CODEISLAND_HOOK_STALE_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|ms| *ms > 0)
+                .unwrap_or(codeisland_core::session::HOOK_STALE_MS),
             next_request_id: AtomicU64::new(1),
         }
     }
@@ -1064,6 +1073,13 @@ fn scan_once(
     let alive: Vec<String> = found.iter().map(|item| item.session_id.clone()).collect();
     let mut updates: Vec<ViewUpdate> = Vec::new();
 
+    // Sessions with a card still up: their rows stay no matter how old, because
+    // a human is being asked something right now.
+    let parked: Vec<String> = match shared.pending.lock() {
+        Ok(pending) => pending.parked_sessions(),
+        Err(poisoned) => poisoned.into_inner().parked_sessions(),
+    };
+
     let Ok(mut registry) = shared.registry.lock() else {
         return;
     };
@@ -1100,6 +1116,14 @@ fn scan_once(
         }
     }
     updates.extend(registry.forget_discovered_not_in(&alive, now));
+    // Hook rows whose event stream went silent are history too, not just
+    // discovered ones: a killed agent, a CLI without a SessionEnd hook, or a
+    // leftover demo card otherwise keeps showing its last status forever --
+    // measured here as a `working` row still on the island over an hour after
+    // its last event. Kept while any witness speaks for it: discovery still
+    // pairing it (a live process), or a card still parked. Upstream sweeps the
+    // same rows on the same clock (stale monitor-less sessions, 10 minutes).
+    updates.extend(registry.forget_hook_stale(&alive, &parked, shared.hook_stale_ms, now));
     drop(registry);
 
     if updates.is_empty() {

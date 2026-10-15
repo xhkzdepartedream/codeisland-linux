@@ -40,6 +40,18 @@ pub enum Origin {
 /// blink out of the island.
 pub const DISCOVERED_GRACE_MS: u64 = 30_000;
 
+/// How long a hook row survives after the agent's own event stream goes silent,
+/// when nothing else speaks for it either: no parked request, and no live process
+/// discovery can still pair it to.
+///
+/// A hook row is the agent's statement, so it is never dropped on a whim -- only
+/// when every witness has gone quiet. Upstream removes the same sessions on the
+/// same clock: its maintenance timer drops stale sessions without a process
+/// monitor after `defaultStaleIdleMinutes = 10`. The agent thinking for minutes
+/// is covered on this side by discovery: while its process lives, the id stays in
+/// `alive` and the row stays up no matter how long the last tool call takes.
+pub const HOOK_STALE_MS: u64 = 10 * 60 * 1000;
+
 /// What an agent session is doing, as the island must present it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -429,6 +441,56 @@ impl SessionRegistry {
             .collect()
     }
 
+    /// Drop hook rows whose event stream has gone silent, when no other witness
+    /// speaks for them.
+    ///
+    /// A hook row is the agent's own statement, so three things must all hold
+    /// before it becomes history:
+    ///
+    /// 1. **Not in `alive`** -- discovery still pairs the session to a live
+    ///    process. This is the Linux stand-in for upstream's process monitor:
+    ///    while the agent's process lives, an hour-long tool call is a session,
+    ///    not a stale row.
+    /// 2. **Not in `parked`** -- a card from this session is still up, so a human
+    ///    is being asked something right now. Dropping the row would orphan the
+    ///    card's "needs you" claim on the header.
+    /// 3. **Older than the caller's stale window** -- the last event is far
+    ///    enough back that "it will speak again" has stopped being the likely
+    ///    reading. Passed in rather than fixed so the daemon honour its
+    ///    `CODEISLAND_HOOK_STALE_MS` override; the default is [`HOOK_STALE_MS`].
+    ///
+    /// What remains is exactly the row nobody can vouch for: a killed agent, a
+    /// CLI that never sends `SessionEnd`, or a leftover demo card. Measured on
+    /// this machine: a card-holder's session kept showing `working` for over an
+    /// hour after its last event, and nothing ever removed it.
+    pub fn forget_hook_stale(
+        &mut self,
+        alive: &[String],
+        parked: &[String],
+        stale_ms: u64,
+        now_ms: u64,
+    ) -> Vec<ViewUpdate> {
+        let stale: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.origin == Origin::Hook)
+            .filter(|(id, session)| {
+                !alive.contains(id)
+                    && !parked.contains(id)
+                    && session.last_event_ms + stale_ms < now_ms
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        stale
+            .into_iter()
+            .map(|id| {
+                self.sessions.remove(&id);
+                self.order.retain(|existing| existing != &id);
+                ViewUpdate::SessionRemove { id }
+            })
+            .collect()
+    }
+
     pub fn release_request(&mut self, session_id: &str) -> Option<ViewUpdate> {
         let session = self.sessions.get_mut(session_id)?;
         // Both "waiting" states mean the island was asked to act: a permission gate
@@ -637,6 +699,17 @@ mod permission_wire_tests {
     use super::*;
     use crate::protocol::Behavior;
 
+    /// Same shape as the first test module's `event()`, built here because this
+    /// module cannot reach that module's private helper.
+    fn hook_event(name: &str, session: &str) -> HookEvent {
+        HookEvent {
+            source: Some("claude".into()),
+            normalized_event: Some(name.into()),
+            session_id: Some(session.into()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn permission_request_round_trips_through_json() {
         let update = ViewUpdate::PermissionRequested {
@@ -834,6 +907,91 @@ mod permission_wire_tests {
             panic!("snapshot shape changed");
         };
         assert!(sessions.is_empty(), "removed rows must not linger in the order");
+    }
+
+    /// The measured bug this file's hook sweep exists for: a card-holder's session
+    /// whose last event was over an hour ago kept showing `working` on the island
+    /// forever, because only discovered rows were ever forgotten.
+    #[test]
+    fn a_stale_hook_session_is_forgotten() {
+        let mut reg = SessionRegistry::new();
+        reg.apply(&hook_event("SessionStart", "s1"), 1_000);
+        reg.apply(&hook_event("Stop", "s1"), 2_000);
+        let now = 2_000 + HOOK_STALE_MS + 1;
+        let gone = reg.forget_hook_stale(&[], &[], HOOK_STALE_MS, now);
+        assert_eq!(
+            gone,
+            vec![ViewUpdate::SessionRemove { id: "s1".into() }],
+            "a silent hook row with no witness is history: {gone:?}"
+        );
+        assert_eq!(reg.len(), 0, "removed rows must not linger in the order");
+    }
+
+    #[test]
+    fn a_hook_session_discovery_still_sees_is_kept() {
+        // The Linux stand-in for upstream's process monitor: while discovery pairs
+        // the session to a live process, an hour-long tool call is a session, not
+        // a stale row. No hook event is needed to keep it.
+        let mut reg = SessionRegistry::new();
+        reg.apply(&hook_event("SessionStart", "s1"), 1_000);
+        let now = 1_000 + 10 * HOOK_STALE_MS;
+        let gone = reg.forget_hook_stale(&["s1".into()], &[], HOOK_STALE_MS, now);
+        assert!(gone.is_empty(), "a live process vouches for the row: {gone:?}");
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn a_hook_session_with_a_parked_request_is_kept() {
+        // A card from this session is still up: a human is being asked something
+        // right now, and dropping the row would orphan the card's claim.
+        let mut reg = SessionRegistry::new();
+        reg.apply(&hook_event("SessionStart", "s1"), 1_000);
+        let now = 1_000 + 10 * HOOK_STALE_MS;
+        let gone = reg.forget_hook_stale(&[], &["s1".into()], HOOK_STALE_MS, now);
+        assert!(gone.is_empty(), "a parked card vouches for the row: {gone:?}");
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn a_fresh_hook_session_is_kept() {
+        // Ten minutes is upstream's clock for monitor-less sessions; inside it,
+        // "it will speak again" is still the likely reading and the row stays.
+        let mut reg = SessionRegistry::new();
+        reg.apply(&hook_event("SessionStart", "s1"), 1_000);
+        let now = 1_000 + HOOK_STALE_MS - 1;
+        let gone = reg.forget_hook_stale(&[], &[], HOOK_STALE_MS, now);
+        assert!(gone.is_empty(), "inside the grace window nothing is dropped: {gone:?}");
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn the_hook_sweep_never_touches_discovered_rows() {
+        // Discovered rows have their own sweep (`forget_discovered_not_in`, 30 s
+        // grace). A hook sweep that also ate them would apply a 10-minute clock
+        // to rows whose own rule is 30 seconds, and vice versa -- the two clocks
+        // must not cross.
+        let mut reg = SessionRegistry::new();
+        reg.register_discovered("d1", "pi", "/tmp/p", None, SessionStatus::Idle, None, true, 1_000);
+        let now = 1_000 + 10 * HOOK_STALE_MS;
+        let gone = reg.forget_hook_stale(&[], &[], HOOK_STALE_MS, now);
+        assert!(gone.is_empty(), "discovered rows are another sweep's business: {gone:?}");
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[test]
+    fn the_stale_window_is_the_caller_s_choice() {
+        // The daemon honours CODEISLAND_HOOK_STALE_MS, so the window is a
+        // parameter, not a constant -- a one-minute sweep must work exactly like
+        // the ten-minute one, just faster.
+        let mut reg = SessionRegistry::new();
+        reg.apply(&hook_event("SessionStart", "s1"), 1_000);
+        let one_minute = 60_000;
+        assert!(reg.forget_hook_stale(&[], &[], one_minute, 1_000 + one_minute - 1).is_empty());
+        assert_eq!(
+            reg.forget_hook_stale(&[], &[], one_minute, 1_000 + one_minute + 1).len(),
+            1,
+            "the sweep fires just past the caller's window"
+        );
     }
 
 }

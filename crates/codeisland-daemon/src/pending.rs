@@ -107,6 +107,22 @@ impl PendingRequests {
             .any(|entry| entry.session_id == session_id)
     }
 
+    /// Session ids that still have a parked request, deduplicated.
+    ///
+    /// Lets the lifecycle sweep keep those rows up no matter how old their last
+    /// event is: a session whose card is on screen is waiting on a human, and
+    /// removing it would orphan the card.
+    pub fn parked_sessions(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .entries
+            .values()
+            .map(|entry| entry.session_id.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// A human answered. Returns the session it belonged to when the request was
     /// actually still parked, which lets the caller ignore a decision that arrived
     /// after a withdrawal.
@@ -295,6 +311,27 @@ mod tests {
             "both cards are gone, so the session no longer waits on a human"
         );
         assert_eq!(await_decision(&second), Some(Decision::plain(Behavior::Deny)));
+    }
+
+    #[test]
+    fn parked_sessions_are_deduplicated() {
+        // The sweep passes this list to the registry, so one session with two
+        // cards up must not appear twice -- and a session whose cards are all
+        // gone must not appear at all.
+        let mut pending = PendingRequests::default();
+        park_plain(&mut pending, "r1", 7, "shared");
+        park_plain(&mut pending, "r2", 7, "shared");
+        park_plain(&mut pending, "r3", 8, "other");
+
+        assert_eq!(pending.parked_sessions(), vec!["other".to_string(), "shared".to_string()]);
+
+        pending.withdraw("r1");
+        pending.withdraw("r2");
+        assert_eq!(
+            pending.parked_sessions(),
+            vec!["other".to_string()],
+            "a session with no cards up no longer waits on a human"
+        );
     }
 
     #[test]
