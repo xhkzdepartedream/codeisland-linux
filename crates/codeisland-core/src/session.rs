@@ -213,6 +213,14 @@ pub enum ViewCommand {
     /// looking at the agent and answering it are different choices. A client that
     /// cannot jump (an older shell, or a remote viewer) simply does not send this.
     Jump { session_id: String },
+    /// "I will answer this one in the terminal instead."
+    ///
+    /// The card comes down and its hook is released to *silence* -- never allow,
+    /// never deny -- so the CLI falls back to its own prompt. This is the escape
+    /// hatch that keeps a question card from being a dead end when none of the
+    /// offered options fit, and it is the one command a human can always send:
+    /// it asks nothing of the agent and risks nothing on its behalf.
+    Withdraw { request_id: String },
 }
 
 /// All live sessions.
@@ -809,6 +817,28 @@ mod permission_wire_tests {
         })
         .unwrap();
         assert_eq!(text, r#"{"type":"jump","session_id":"s7"}"#, "{text}");
+    }
+
+    #[test]
+    fn a_withdraw_command_names_only_the_request() {
+        // "Skip this question, I will answer in the terminal." It carries no
+        // behavior and no answers, because it is neither: the daemon must not be
+        // able to read an allow or a deny out of it, even by accident.
+        let command: ViewCommand =
+            serde_json::from_str(r#"{"type":"withdraw","request_id":"q7"}"#).unwrap();
+        match command {
+            ViewCommand::Withdraw { request_id } => assert_eq!(request_id, "q7"),
+            other => panic!("unexpected {other:?}"),
+        }
+        let text = serde_json::to_string(&ViewCommand::Withdraw {
+            request_id: "q7".into(),
+        })
+        .unwrap();
+        assert_eq!(text, r#"{"type":"withdraw","request_id":"q7"}"#, "{text}");
+        assert!(
+            !text.contains("behavior") && !text.contains("answers"),
+            "a withdraw must not smell like a decision: {text}"
+        );
     }
 
     #[test]

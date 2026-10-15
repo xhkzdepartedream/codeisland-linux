@@ -508,6 +508,36 @@ delegate: Rectangle {
                                 font.pixelSize: 11
                             }
 
+                            // 跳过. Not an answer: the daemon releases the hook to
+                            // silence and the CLI asks again in its own terminal --
+                            // the escape hatch for "none of these options fit". Always
+                            // enabled, because it promises nothing on anyone's behalf.
+                            Rectangle {
+                                Layout.preferredWidth: 58
+                                Layout.preferredHeight: 28
+                                radius: 8
+                                color: skipArea.containsMouse ? "#1e2b22" : "#141a16"
+                                border.width: 1
+                                border.color: "#3a4a40"
+
+                                Text {
+                                    anchors.centerIn: parent
+                                    text: "跳过"
+                                    color: "#98989d"
+                                    font.pixelSize: 12
+                                }
+                                MouseArea {
+                                    id: skipArea
+                                    anchors.fill: parent
+                                    hoverEnabled: true
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: {
+                                        console.log("question skipped, requestId=" + requestId)
+                                        daemon.withdraw(requestId)
+                                    }
+                                }
+                            }
+
                             Rectangle {
                                 Layout.preferredWidth: 104
                                 Layout.preferredHeight: 28

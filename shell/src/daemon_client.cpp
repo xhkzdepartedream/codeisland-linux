@@ -200,6 +200,33 @@ void DaemonClient::jump(const QString &sessionId)
     }
 }
 
+void DaemonClient::withdraw(const QString &requestId)
+{
+    qInfo() << "codeisland-shell: withdraw() called" << requestId;
+    if (requestId.isEmpty()) {
+        qWarning() << "codeisland-shell: withdraw() dropped: empty request id";
+        return;
+    }
+    // Not a decision, so not through writeDecision's logging wording: that helper
+    // exists so decide/answer cannot drift apart, and this carries no behavior at
+    // all -- the payload is deliberately too small to smuggle an answer in.
+    QJsonObject payload{
+        {QStringLiteral("type"), QStringLiteral("withdraw")},
+        {QStringLiteral("request_id"), requestId},
+    };
+    QByteArray line = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    line.append('\n');
+    if (m_socket->state() != QLocalSocket::ConnectedState) {
+        // Nothing is parked on our behalf anymore: the daemon released it when the
+        // connection dropped. Skipping then has nothing to skip.
+        qWarning() << "codeisland-shell: withdraw dropped, daemon not connected";
+        return;
+    }
+    if (m_socket->write(line) < 0) {
+        qWarning() << "codeisland-shell: failed to send withdraw" << m_socket->errorString();
+    }
+}
+
 void DaemonClient::writeDecision(const QJsonObject &payload)
 {
     QByteArray line = QJsonDocument(payload).toJson(QJsonDocument::Compact);

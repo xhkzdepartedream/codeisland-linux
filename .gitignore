@@ -19,3 +19,6 @@ events.jsonl
 # python harness scratch
 __pycache__/
 *.pyc
+
+# Agent working scratch (upstream sources, verification scripts, screenshots).
+/.temp/

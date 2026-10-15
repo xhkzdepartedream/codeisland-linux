@@ -54,6 +54,13 @@ public:
     /// card simply stays where it is.
     Q_INVOKABLE void jump(const QString &sessionId);
 
+    /// Skip a card: the human will answer in the terminal instead.
+    ///
+    /// Neither allow nor deny -- the daemon releases the hook to silence so the
+    /// CLI falls back to its own prompt. The one command that can always be sent:
+    /// it promises nothing on the human's behalf.
+    Q_INVOKABLE void withdraw(const QString &requestId);
+
 signals:
     void connectedChanged();
 

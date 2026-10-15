@@ -409,6 +409,29 @@ fn read_viewer(viewer_id: u64, shared: &Arc<Shared>) {
                                 println!("codeisland-daemon:   -> jump {outcome:?}");
                             });
                         }
+                        Ok(ViewCommand::Withdraw { request_id }) => {
+                            // "I will answer this one in the terminal instead." The
+                            // parked hook is released to silence -- never allow, never
+                            // deny -- exactly like a viewer that disconnected: the CLI
+                            // falls back to its own prompt, which is the outcome the
+                            // human asked for. The card and the session's "needs you"
+                            // flag go with it.
+                            let released = match shared.pending.lock() {
+                                Ok(mut pending) => pending.withdraw(&request_id),
+                                Err(poisoned) => poisoned.into_inner().withdraw(&request_id),
+                            };
+                            match released {
+                                Some(session_id) => {
+                                    println!(
+                                        "codeisland-daemon: request {request_id} withdrawn by viewer {viewer_id}, leaving the decision to the CLI"
+                                    );
+                                    release_gate(shared, &request_id, &session_id);
+                                }
+                                None => println!(
+                                    "codeisland-daemon: ignoring withdraw for unknown request {request_id}"
+                                ),
+                            }
+                        }
                         Err(err) => {
                             eprintln!("codeisland-daemon: malformed command from viewer: {err}")
                         }
