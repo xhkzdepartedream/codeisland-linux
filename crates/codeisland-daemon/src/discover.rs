@@ -97,6 +97,9 @@ pub struct Discovered {
     /// user prompt as the universal fallback. The row leads with this instead of the
     /// project label when present -- see `transcript_title`.
     pub title: Option<String>,
+    /// Token usage the harness stated about the session, when it does (codex's
+    /// cumulative counter; see `transcript_usage`).
+    pub usage: Option<codeisland_core::session::Usage>,
     pub cwd: String,
     pub transcript: PathBuf,
     /// The checked-out git branch in `cwd`, when it could be read from disk. Kept on the row
@@ -178,6 +181,56 @@ pub fn transcript_cwd(path: &Path) -> Option<String> {
         .flatten()
         {
             return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Everything a scan remembers between runs, so a file nobody is rewriting
+/// is parsed once ever and a growing file is re-read only when it grew.
+///
+/// The cache keys each file by its size, which is cheap and monotonic: any
+/// append changes the size, and nothing else about a transcript changes.
+#[derive(Default)]
+pub struct ParseCache {
+    pub cwd: std::collections::HashMap<PathBuf, (u64, Option<String>)>,
+    pub title: std::collections::HashMap<PathBuf, (u64, Option<String>)>,
+    pub usage: std::collections::HashMap<PathBuf, (u64, Option<codeisland_core::session::Usage>)>,
+}
+
+/// Token usage one transcript states about its session.
+///
+/// codex writes a running cumulative counter -- `event_msg` / `token_count` →
+/// `payload.info.total_token_usage` -- so the newest such row IS the session's
+/// total and a tail read suffices. Measured on this machine: two days of
+/// rollouts carry 941 of these rows, so the bottom bar's numbers are real.
+/// claude's `message.usage` is per-response (a session total needs a whole-file
+/// sum, unbounded on big transcripts) and pi writes nothing structured, so both
+/// stay out until a bounded source is measured -- the bar shows what is true.
+pub fn transcript_usage(path: &Path) -> Option<codeisland_core::session::Usage> {
+    let tail = read_tail(path, 64 * 1024)?;
+    for line in tail.lines().rev() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").and_then(|t| t.as_str()) != Some("event_msg") {
+            continue;
+        }
+        let Some(payload) = value.get("payload") else { continue };
+        if payload.get("type").and_then(|t| t.as_str()) != Some("token_count") {
+            continue;
+        }
+        // `total_token_usage` is the harness's own running sum for the session:
+        // input_tokens counts every token read, output_tokens every one written.
+        let Some(total) = payload.get("info").and_then(|info| info.get("total_token_usage")) else {
+            continue;
+        };
+        let usage = codeisland_core::session::Usage {
+            input_tokens: total.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+            output_tokens: total.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+        };
+        if usage.input_tokens > 0 || usage.output_tokens > 0 {
+            return Some(usage);
         }
     }
     None
@@ -523,11 +576,10 @@ pub fn discover(
     now_ms: u64,
     max_age_ms: u64,
     probe_limit: usize,
-    cwd_cache: &mut std::collections::HashMap<PathBuf, (u64, Option<String>)>,
-    title_cache: &mut std::collections::HashMap<PathBuf, (u64, Option<String>)>,
+    cache: &mut ParseCache,
 ) -> Vec<Discovered> {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    discover_in(&home, agent_processes(), now_ms, max_age_ms, probe_limit, cwd_cache, title_cache)
+    discover_in(&home, agent_processes(), now_ms, max_age_ms, probe_limit, cache)
 }
 
 /// Where codex's home is, honouring `CODEX_HOME` exactly like `archive_roots` does.
@@ -553,8 +605,7 @@ pub fn discover_in(
     now_ms: u64,
     max_age_ms: u64,
     probe_limit: usize,
-    cwd_cache: &mut std::collections::HashMap<PathBuf, (u64, Option<String>)>,
-    title_cache: &mut std::collections::HashMap<PathBuf, (u64, Option<String>)>,
+    cache: &mut ParseCache,
 ) -> Vec<Discovered> {
     let roots = archive_roots(home);
     let mut out: Vec<Discovered> = Vec::new();
@@ -611,6 +662,7 @@ pub fn discover_in(
             cwd: String,
             session_id: String,
             title: Option<String>,
+            usage: Option<codeisland_core::session::Usage>,
             last_write_ms: u64,
         }
         // Codex names its threads in a small index beside the archives; read it once per
@@ -631,11 +683,11 @@ pub fn discover_in(
             // The cwd of a transcript never changes once written, so cache on size: a file
             // nobody is rewriting is parsed once ever, not once per scan.
             let size = meta.len();
-            let cwd = match cwd_cache.get(&path) {
+            let cwd = match cache.cwd.get(&path) {
                 Some((cached_size, cached_cwd)) if *cached_size == size => cached_cwd.clone(),
                 _ => {
                     let found = transcript_cwd(&path);
-                    cwd_cache.insert(path.clone(), (size, found.clone()));
+                    cache.cwd.insert(path.clone(), (size, found.clone()));
                     found
                 }
             };
@@ -643,14 +695,24 @@ pub fn discover_in(
             // The title *can* appear later -- a first prompt lands with the first turn, a
             // claude custom-title mid-session -- so the cache re-extracts whenever the file
             // has grown, and only holds a settled value for a file that stopped moving.
-            let title = match title_cache.get(&path) {
+            let title = match cache.title.get(&path) {
                 Some((cached_size, cached_title)) if *cached_size == size => cached_title.clone(),
                 _ => {
                     let found = codex_names
                         .get(session_id.as_deref().unwrap_or(""))
                         .cloned()
                         .or_else(|| transcript_title(&path));
-                    title_cache.insert(path.clone(), (size, found.clone()));
+                    cache.title.insert(path.clone(), (size, found.clone()));
+                    found
+                }
+            };
+            // Usage only grows with a live session, so the same size key re-reads a
+            // moving file and settles a quiet one.
+            let usage = match cache.usage.get(&path) {
+                Some((cached_size, cached_usage)) if *cached_size == size => *cached_usage,
+                _ => {
+                    let found = transcript_usage(&path);
+                    cache.usage.insert(path.clone(), (size, found));
                     found
                 }
             };
@@ -662,6 +724,7 @@ pub fn discover_in(
                 cwd,
                 session_id,
                 title,
+                usage,
                 last_write_ms: millis_of(&meta),
             });
         }
@@ -773,6 +836,7 @@ pub fn discover_in(
                 harness: *harness,
                 session_id: entry.session_id.clone(),
                 title: entry.title.clone(),
+                usage: entry.usage,
                 cwd: entry.cwd.clone(),
                 transcript: entry.path.clone(),
                 branch: codeisland_core::git::head_branch(std::path::Path::new(&entry.cwd)),
@@ -1218,9 +1282,8 @@ mod tests {
             started_ms: now_ms() - 60_000,
         }];
         let home = root.clone();
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&home, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&home, processes, now_ms(), 600_000, 50, &mut cache);
         assert_eq!(found.len(), 1, "exactly one session should match the cwd");
         assert_eq!(found[0].transcript, here);
         assert_ne!(found[0].transcript, other);
@@ -1251,9 +1314,8 @@ mod tests {
             started_ms: now_ms() - 60_000,
         }];
         let home = root.clone();
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&home, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&home, processes, now_ms(), 600_000, 50, &mut cache);
         assert_eq!(found.len(), 1, "the running session must be visible: {found:?}");
         assert_eq!(found[0].transcript, transcript);
         assert_eq!(found[0].cwd, "/home/u/pi-sessions/agent universe");
@@ -1279,9 +1341,8 @@ mod tests {
             cwd: PathBuf::from("/home/xhkz"), // pi chdirs to $HOME at start-up
             started_ms: at, // the new agent opened *after* the old session ended
         }];
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, at + 60_000, 2 * 60 * 60 * 1000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, at + 60_000, 2 * 60 * 60 * 1000, 50, &mut cache);
         assert!(
             found.is_empty(),
             "an empty new agent must not inherit the previous session: {found:?}"
@@ -1305,9 +1366,8 @@ mod tests {
             cwd: PathBuf::from("/home/xhkz"),
             started_ms: at - 60_000, // alive before the last write
         }];
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, at + 90 * 60_000, 2 * 60 * 60 * 1000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, at + 90 * 60_000, 2 * 60 * 60 * 1000, 50, &mut cache);
         assert_eq!(found.len(), 1, "a parked agent is still a session: {found:?}");
         assert_eq!(found[0].transcript, transcript);
         fs::remove_dir_all(&root).ok();
@@ -1328,9 +1388,8 @@ mod tests {
             AgentProcess { harness: Harness::Pi, pid: 1, cwd: PathBuf::from("/home/xhkz"), started_ms: at - 3_600_000 },
             AgentProcess { harness: Harness::Pi, pid: 2, cwd: PathBuf::from("/home/xhkz"), started_ms: at - 60_000 },
         ];
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, at, 2 * 60 * 60 * 1000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, at, 2 * 60 * 60 * 1000, 50, &mut cache);
         assert_eq!(found.len(), 1, "the older process can still own it: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
@@ -1351,9 +1410,8 @@ mod tests {
             cwd: PathBuf::from("/tmp/proj"), // sitting right in it
             started_ms: at, // opened after the session ended
         }];
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, at + 60_000, 2 * 60 * 60 * 1000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, at + 60_000, 2 * 60 * 60 * 1000, 50, &mut cache);
         assert!(found.is_empty(), "the directory match must not resurrect: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
@@ -1372,9 +1430,8 @@ mod tests {
             cwd: PathBuf::from("/home/xhkz"),
             started_ms: 0, // unknown
         }];
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
         assert_eq!(found.len(), 1, "no bound is applied when the start is unknown: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
@@ -1385,9 +1442,8 @@ mod tests {
         // bound the island would list every recent conversation as if it were running.
         let root = std::env::temp_dir().join(format!("ci-discover-idle-{}", now_ms()));
         fixture(&root, Harness::Pi, "/tmp/proj", "fresh", "{}");
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, Vec::new(), now_ms(), 600_000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, Vec::new(), now_ms(), 600_000, 50, &mut cache);
         assert!(found.is_empty(), "no process means no session: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
@@ -1410,9 +1466,8 @@ mod tests {
             cwd: PathBuf::from("/tmp/elsewhere"),
             started_ms: now_ms() - 3_600_000,
         }];
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, an_hour_later, 60_000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, an_hour_later, 60_000, 50, &mut cache);
         assert!(found.is_empty(), "an hour-old transcript is not a live session: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
@@ -1431,9 +1486,8 @@ mod tests {
             started_ms: now_ms() - 60_000,
         }];
         let an_hour_later = now_ms() + 3_600_000;
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, an_hour_later, 60_000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, an_hour_later, 60_000, 50, &mut cache);
         assert_eq!(found.len(), 1, "a quiet session with a live process is still a session");
         assert_eq!(found[0].pid, Some(1));
         fs::remove_dir_all(&root).ok();
@@ -1523,9 +1577,8 @@ mod tests {
             AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj"), started_ms: now_ms() - 60_000 },
             AgentProcess { harness: Harness::Codex, pid: 11, cwd: PathBuf::from("/tmp/proj"), started_ms: now_ms() - 60_000 },
         ];
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
         let ids: Vec<&str> = found.iter().map(|d| d.session_id.as_str()).collect();
         assert!(ids.contains(&parent_id), "the parent must be shown: {ids:?}");
         assert!(!ids.contains(&child_id), "the subagent must fold into it: {ids:?}");
@@ -1550,9 +1603,8 @@ mod tests {
             })),
         ).unwrap();
         let processes = vec![AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj"), started_ms: now_ms() - 60_000 }];
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
         assert_eq!(found.len(), 1, "an orphan subagent is still a live session: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
@@ -1668,9 +1720,8 @@ mod tests {
         filetime(&older, now_ms() - 3_600_000);
 
         let processes = vec![AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj"), started_ms: now_ms() - 60_000 }];
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
         assert_eq!(found.len(), 1, "one thread is one row: {found:?}");
         assert_eq!(found[0].transcript, newer, "the live rollout must win, not the stale one");
         let hint = tail_hint(&found[0].transcript).unwrap();
@@ -1736,9 +1787,8 @@ mod tests {
                 started_ms: now_ms() - 60_000,
             },
         ];
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
         assert_eq!(found.len(), 2, "two sessions in one directory are two rows: {found:?}");
         let transcripts: Vec<PathBuf> = found.iter().map(|d| d.transcript.clone()).collect();
         assert_ne!(transcripts[0], transcripts[1], "one transcript claimed twice");
@@ -1746,8 +1796,7 @@ mod tests {
         assert!(ids.contains(&"one") && ids.contains(&"two"), "both ids present: {ids:?}");
 
         // A single process in that same directory takes exactly one row -- the newest.
-        let mut cache2 = std::collections::HashMap::new();
-        let mut titles2 = std::collections::HashMap::new();
+        let mut cache2 = ParseCache::default();
         let alone = discover_in(
             &root,
             vec![AgentProcess {
@@ -1760,7 +1809,6 @@ mod tests {
             600_000,
             50,
             &mut cache2,
-            &mut titles2,
         );
         assert_eq!(alone.len(), 1, "one process must not invent two sessions: {alone:?}");
         fs::remove_dir_all(&root).ok();
@@ -1815,9 +1863,8 @@ mod tests {
             AgentProcess { harness: Harness::Claude, pid: 2, cwd: PathBuf::from("/tmp/p"), started_ms: now_ms() - 60_000 },
             AgentProcess { harness: Harness::Pi, pid: 3, cwd: PathBuf::from("/home/u"), started_ms: now_ms() - 60_000 },
         ];
-        let mut cache = std::collections::HashMap::new();
-        let mut titles = std::collections::HashMap::new();
-        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache, &mut titles);
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
         let title_of = |harness: Harness| {
             found
                 .iter()
@@ -1916,5 +1963,78 @@ mod tests {
         assert!(hint.contains("先看配置再改代码"), "pi message text: {hint}");
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn usage_reads_codexs_own_running_total_from_the_tail() {
+        // The measured shape (rollouts on this machine carry 941 of these rows
+        // across two days): `event_msg`/`token_count` → `payload.info.total_token_usage`,
+        // a cumulative counter the harness itself maintains. The newest row IS
+        // the session total, so the tail suffices and no summing is done here.
+        let dir = std::env::temp_dir().join(format!("ci-discover-usage-{}", now_ms()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout.jsonl");
+        fs::write(
+            &path,
+            format!("{}\n{}\n{}\n",
+                // An older, smaller counter -- must lose to the newer one below.
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":28_766,"output_tokens":361}}}}),
+                // Noise rows between the two counters.
+                serde_json::json!({"type":"event_msg","payload":{"type":"item_completed"}}),
+                // The newest row: the answer.
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":60_762,"output_tokens":664}}}})),
+        ).unwrap();
+        let usage = transcript_usage(&path).expect("the counter is stated");
+        assert_eq!(usage.input_tokens, 60_762, "newest total wins: {usage:?}");
+        assert_eq!(usage.output_tokens, 664);
+
+        // A transcript that states no counter states no usage -- an all-zero
+        // counter is the same absence, not a session that used nothing.
+        let bare = dir.join("bare.jsonl");
+        fs::write(
+            &bare,
+            format!("{}\n{}\n",
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":0,"output_tokens":0}}}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"item_completed"}})),
+        ).unwrap();
+        assert!(transcript_usage(&bare).is_none(), "zeros are not usage");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn discovered_rows_carry_the_usage_the_harness_stated() {
+        // End to end through the same discover_in the production scan runs:
+        // the counter must reach the row, where scan_once hands it to the
+        // registry for both origins to see.
+        let root = std::env::temp_dir().join(format!("ci-discover-usage-e2e-{}", now_ms()));
+        let dir = root.join(".codex/sessions");
+        fs::create_dir_all(&dir).unwrap();
+        let thread = "01a139b5-e5a5-77b0-a481-a86d0b4150b9";
+        fs::write(
+            dir.join(format!("rollout-2026-10-15T13-11-30-{thread}.jsonl")),
+            format!("{}\n{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"cwd":"/tmp/proj","id":thread}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"token_count","info":{
+                    "total_token_usage":{"input_tokens":60_762,"output_tokens":664}}}})),
+        ).unwrap();
+        let processes = vec![AgentProcess {
+            harness: Harness::Codex,
+            pid: 10,
+            cwd: PathBuf::from("/tmp/proj"),
+            started_ms: now_ms() - 60_000,
+        }];
+        let mut cache = ParseCache::default();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].usage,
+            Some(codeisland_core::session::Usage { input_tokens: 60_762, output_tokens: 664 }),
+            "the harness's own counter reaches the row: {:?}",
+            found[0]
+        );
+        fs::remove_dir_all(&root).ok();
     }
 }

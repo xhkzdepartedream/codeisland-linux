@@ -30,6 +30,10 @@ struct SessionRow {
     QString origin = QStringLiteral("hook");
     /// Checked-out git branch, read from `.git` by the daemon. Empty when there is no repo.
     QString branch;
+    /// Token usage the harness stated about the session (`{input_tokens, output_tokens}`),
+    /// empty when it never did. Feeds the bottom bar's aggregate, which is the only
+    /// place it renders -- no per-row display, matching upstream's bar-not-card shape.
+    QVariantMap usage;
     /// True when the status was stated by the harness (turn record / hook), false when
     /// the daemon fell back to a freshness guess. Only the latter is an inference.
     bool status_stated = false;
@@ -52,6 +56,10 @@ class SessionsModel final : public QAbstractListModel
     Q_PROPERTY(bool agentGrouped READ agentGrouped WRITE setAgentGrouped NOTIFY agentGroupedChanged)
     /// "codex 2 · pi 1" for the bottom bar: live sessions per tool.
     Q_PROPERTY(QString sourceSummary READ sourceSummary NOTIFY changed)
+    /// "codex 输入 60.8K 输出 0.7K" for the bottom bar: token usage the harnesses
+    /// actually stated, aggregated per tool. Empty when nothing stated any -- no
+    /// estimated numbers ever appear here.
+    Q_PROPERTY(QString usageSummary READ usageSummary NOTIFY changed)
 
 public:
     enum Roles {
@@ -92,6 +100,7 @@ public:
     QString headlineStatus() const;
     int needingAttention() const;
     QString sourceSummary() const;
+    QString usageSummary() const;
 
     /// Last path component of the working directory: the card's title.
     static QString projectLabel(const QString &cwd, const QString &fallback);

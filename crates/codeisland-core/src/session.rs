@@ -85,6 +85,20 @@ impl SessionStatus {
     }
 }
 
+/// Token usage a harness stated about one session.
+///
+/// codex writes a running cumulative total (`event_msg`/`token_count` →
+/// `payload.info.total_token_usage`), so the newest row IS the session's
+/// usage. Measured on this machine: 941 such rows across two days of rollouts.
+/// claude's `message.usage` is per-response and would need a whole-file sum
+/// (unbounded on 12 MB transcripts), so it stays out until a bounded source
+/// is measured; pi has no structured usage records at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// One agent session as rendered on the island.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Session {
@@ -95,6 +109,10 @@ pub struct Session {
     /// `SessionTitleStore.swift` upstream, which reads the same sources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Token usage the harness stated about this session, when it does. Codex's
+    /// cumulative counter; see `Usage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
     pub status: SessionStatus,
     /// Directory the agent is working in; the island shows its last component as
     /// the session's human label.
@@ -300,6 +318,7 @@ impl SessionRegistry {
                 id: id.clone(),
                 source: source.clone(),
                 title: None,
+                usage: None,
                 status: SessionStatus::Idle,
                 cwd: None,
                 branch: None,
@@ -422,6 +441,7 @@ impl SessionRegistry {
             id: id.to_string(),
             source: source.to_string(),
             title: None,
+            usage: None,
             status,
             cwd: Some(cwd.to_string()),
             branch,
@@ -527,6 +547,22 @@ impl SessionRegistry {
             return None;
         }
         session.title = Some(title);
+        Some(ViewUpdate::SessionUpsert {
+            session: session.clone(),
+        })
+    }
+
+    /// State the token usage a harness reported about a session. Same rules as
+    /// `set_title`: applies to rows of both origins, `None` never clears (a
+    /// transient read failure must not blank a number that was true), and
+    /// `last_event_ms` is untouched -- a counter is not activity.
+    pub fn set_usage(&mut self, id: &str, usage: Option<Usage>) -> Option<ViewUpdate> {
+        let Some(usage) = usage else { return None };
+        let session = self.sessions.get_mut(id)?;
+        if session.usage == Some(usage) {
+            return None;
+        }
+        session.usage = Some(usage);
         Some(ViewUpdate::SessionUpsert {
             session: session.clone(),
         })
@@ -1098,6 +1134,29 @@ mod permission_wire_tests {
         assert_eq!(reg.get("hooked").unwrap().title.as_deref(), Some("修复登录页"));
         // A missing session is simply nothing to do.
         assert!(reg.set_title("nope", Some("x".into())).is_none());
+    }
+
+    #[test]
+    fn usage_flows_like_a_title_not_like_activity() {
+        // Same three rules as titles: both origins get it, `None` never clears,
+        // and `last_event_ms` is untouched -- a counter is not activity.
+        let mut reg = SessionRegistry::new();
+        reg.apply(&hook_event("SessionStart", "s1"), 1_000);
+        reg.set_usage("s1", Some(Usage { input_tokens: 28_766, output_tokens: 361 }));
+        let row = reg.get("s1").unwrap();
+        assert_eq!(row.usage, Some(Usage { input_tokens: 28_766, output_tokens: 361 }));
+        assert_eq!(row.last_event_ms, 1_000, "a counter is not activity");
+        // Unchanged usage, no update.
+        assert!(reg
+            .set_usage("s1", Some(Usage { input_tokens: 28_766, output_tokens: 361 }))
+            .is_none());
+        // A growing counter is an update.
+        assert!(reg
+            .set_usage("s1", Some(Usage { input_tokens: 60_762, output_tokens: 664 }))
+            .is_some());
+        // None never clears what was true.
+        reg.set_usage("s1", None);
+        assert!(reg.get("s1").unwrap().usage.is_some());
     }
 
 }

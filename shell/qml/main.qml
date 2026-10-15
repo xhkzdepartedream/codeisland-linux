@@ -1097,7 +1097,12 @@ delegate: Rectangle {
                 spacing: 6
                 Text {
                     Layout.fillWidth: true
+                    // Session counts, then the token usage the harnesses actually
+                    // stated -- upstream's bar shape, filled only with true numbers
+                    // (nothing stated shows nothing rather than an estimate).
                     text: sessions.sourceSummary
+                          + (sessions.usageSummary.length > 0
+                             ? "　" + sessions.usageSummary : "")
                     color: "#636366"
                     font.pixelSize: 11
                     elide: Text.ElideRight

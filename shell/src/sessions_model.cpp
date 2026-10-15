@@ -89,7 +89,8 @@ void SessionsModel::applyUpsert(const QVariantMap &session)
         row.origin = QStringLiteral("hook");
     }
     row.branch = session.value(QStringLiteral("branch")).toString();
-        row.status_stated = session.value(QStringLiteral("status_stated")).toBool();
+    row.usage = session.value(QStringLiteral("usage")).toMap();
+    row.status_stated = session.value(QStringLiteral("status_stated")).toBool();
     row.toolCalls = session.value(QStringLiteral("tool_calls")).toInt();
     row.lastEventMs = static_cast<qint64>(session.value(QStringLiteral("last_event_ms")).toDouble());
     row.startedMs = static_cast<qint64>(session.value(QStringLiteral("started_ms")).toDouble());
@@ -149,7 +150,8 @@ void SessionsModel::applySnapshot(const QVariantList &sessions)
             row.origin = QStringLiteral("hook");
         }
         row.branch = map.value(QStringLiteral("branch")).toString();
-            row.status_stated = map.value(QStringLiteral("status_stated")).toBool();
+        row.usage = map.value(QStringLiteral("usage")).toMap();
+        row.status_stated = map.value(QStringLiteral("status_stated")).toBool();
         row.toolCalls = map.value(QStringLiteral("tool_calls")).toInt();
         row.lastEventMs = static_cast<qint64>(map.value(QStringLiteral("last_event_ms")).toDouble());
         row.startedMs = static_cast<qint64>(map.value(QStringLiteral("started_ms")).toDouble());
@@ -226,6 +228,59 @@ QString SessionsModel::sourceSummary() const
     add(QStringLiteral("pi"), pi);
     if (parts.isEmpty()) {
         return QStringLiteral("0");
+    }
+    return parts.join(QStringLiteral(" · "));
+}
+
+/// 60762 -> "60.8K", 836 -> "836", 4200000 -> "4.2M": upstream's shape.
+static QString formatTokens(qint64 tokens)
+{
+    if (tokens < 1000) {
+        return QString::number(tokens);
+    }
+    if (tokens < 1'000'000) {
+        const double k = tokens / 1000.0;
+        const QString one = QString::number(k, 'f', 1);
+        return (one.endsWith(QLatin1String(".0")) ? one.left(one.length() - 2) : one) + QStringLiteral("K");
+    }
+    const double m = tokens / 1'000'000.0;
+    const QString whole = QString::number(m, 'f', 1);
+    return (whole.endsWith(QLatin1String(".0")) ? whole.left(whole.length() - 2) : whole) + QStringLiteral("M");
+}
+
+QString SessionsModel::usageSummary() const
+{
+    // Only numbers a harness actually stated, aggregated per tool in the fixed
+    // reading order. Nothing stated -> empty string -> the bar hides the line;
+    // estimated numbers never appear here.
+    qint64 in[4] = {0, 0, 0, 0};
+    qint64 out[4] = {0, 0, 0, 0};
+    bool any[4] = {false, false, false, false};
+    const auto slotOf = [](const QString &source) {
+        if (source == QLatin1String("claude")) return 0;
+        if (source == QLatin1String("codex")) return 1;
+        if (source == QLatin1String("pi")) return 2;
+        return 3;
+    };
+    for (const SessionRow &row : m_rows) {
+        if (row.usage.isEmpty()) {
+            continue;
+        }
+        const int slot = slotOf(row.source);
+        in[slot] += static_cast<qint64>(row.usage.value(QStringLiteral("input_tokens")).toDouble());
+        out[slot] += static_cast<qint64>(row.usage.value(QStringLiteral("output_tokens")).toDouble());
+        any[slot] = true;
+    }
+    const char *names[4] = {"claude", "codex", "pi", nullptr};
+    QStringList parts;
+    for (int i = 0; i < 4; ++i) {
+        if (!any[i]) {
+            continue;
+        }
+        parts << QStringLiteral("%1 输入 %2 输出 %3")
+                     .arg(QLatin1String(names[i] ? names[i] : "other"),
+                          formatTokens(in[i]),
+                          formatTokens(out[i]));
     }
     return parts.join(QStringLiteral(" · "));
 }

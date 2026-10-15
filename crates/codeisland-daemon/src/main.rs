@@ -117,9 +117,8 @@ fn discover_once() {
             process.cwd.display()
         );
     }
-    let mut cache = HashMap::new();
-    let mut titles = HashMap::new();
-    let found = discover::discover(now, DISCOVER_MAX_AGE_MS, DISCOVER_PROBE, &mut cache, &mut titles);
+    let mut cache = discover::ParseCache::default();
+    let found = discover::discover(now, DISCOVER_MAX_AGE_MS, DISCOVER_PROBE, &mut cache);
     println!("codeisland-daemon: 配上存档的会话 {} 个", found.len());
     for item in &found {
         let liveness = match discover::liveness(item.last_write_ms, now, DISCOVER_ACTIVE_MS) {
@@ -1069,13 +1068,9 @@ fn spawn_discovery(shared: Arc<Shared>) {
     let started = std::thread::Builder::new()
         .name("codeisland-discover".to_string())
         .spawn(move || {
-            let mut cwd_cache: HashMap<std::path::PathBuf, (u64, Option<String>)> = HashMap::new();
-            // Same shape as the cwd cache, for titles: re-extracted when a file has
-            // grown (a first prompt or a claude custom-title can appear mid-session),
-            // settled once the file stops moving.
-            let mut title_cache: HashMap<std::path::PathBuf, (u64, Option<String>)> = HashMap::new();
+            let mut cache = discover::ParseCache::default();
             loop {
-                scan_once(&shared, &mut cwd_cache, &mut title_cache);
+                scan_once(&shared, &mut cache);
                 std::thread::sleep(DISCOVER_INTERVAL);
             }
         });
@@ -1086,11 +1081,10 @@ fn spawn_discovery(shared: Arc<Shared>) {
 
 fn scan_once(
     shared: &Arc<Shared>,
-    cwd_cache: &mut HashMap<std::path::PathBuf, (u64, Option<String>)>,
-    title_cache: &mut HashMap<std::path::PathBuf, (u64, Option<String>)>,
+    cache: &mut discover::ParseCache,
 ) {
     let now = now_ms();
-    let found = discover::discover(now, DISCOVER_MAX_AGE_MS, DISCOVER_PROBE, cwd_cache, title_cache);
+    let found = discover::discover(now, DISCOVER_MAX_AGE_MS, DISCOVER_PROBE, cache);
     if std::env::var_os("CODEISLAND_DEBUG_DISCOVERY").is_some() {
         // Off by default: this runs every few seconds and a daemon that chats in its own log
         // is a daemon nobody reads. When it IS on, "0 rows" must be explainable from the line
@@ -1163,6 +1157,11 @@ fn scan_once(
         // carry a cwd but never a title, so the transcript is the only source
         // and this scan is what reads it. `None` leaves any earlier title alone.
         if let Some(update) = registry.set_title(&item.session_id, item.title.clone()) {
+            updates.push(update);
+        }
+        // Token usage the harness stated, same rules as the title: both origins,
+        // `None` never clears, and the counter is not activity.
+        if let Some(update) = registry.set_usage(&item.session_id, item.usage) {
             updates.push(update);
         }
     }
