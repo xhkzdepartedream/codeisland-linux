@@ -28,10 +28,19 @@ use std::path::Path;
 
 use crate::session::SessionStatus;
 
-/// How much of the end of a transcript to read. The newest lifecycle record sits within the
-/// last few rows, and a row can be large (a tool result carrying a file), so this is generous
-/// while still bounded -- the alternative is reading 19 MB on every scan.
-const TAIL_BYTES: u64 = 64 * 1024;
+/// First window to read from the end of a transcript. The newest lifecycle record usually sits
+/// at the very end, so this finds it after one read and one line parsed.
+const TAIL_START: u64 = 64 * 1024;
+/// Largest window to expand to before giving up.
+///
+/// The window has to grow because a record can sit far behind EOF: a turn writes its
+/// `task_started` and then streams -- measured on this machine, one live codex turn had
+/// `task_started` **456 KB** from the end. A fixed 64 KB tail missed it and fell back to a
+/// freshness guess (which said idle while the turn was running). 8 MB covers transcripts here
+/// several times over while keeping the worst case bounded.
+const TAIL_MAX: u64 = 8 * 1024 * 1024;
+/// How much the window grows on each retry.
+const TAIL_GROWTH: u64 = 8;
 
 /// The turn state a transcript states about itself, or `None` when the tail holds no
 /// lifecycle record at all (an unknown harness, a brand-new empty file, or a shape from a
@@ -40,24 +49,37 @@ const TAIL_BYTES: u64 = 64 * 1024;
 /// `None` is deliberately distinct from `Idle`: the caller must be able to tell "the file
 /// says it is idle" from "the file says nothing", because only the first is a fact.
 pub fn turn_state(path: &Path) -> Option<SessionStatus> {
-    let tail = read_tail(path, TAIL_BYTES)?;
-    let lines: Vec<&str> = tail.lines().collect();
-
-    // Newest first: the most recent lifecycle record is what describes the session *now*.
-    for line in lines.iter().rev() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            // A row cut in half by the tail window, or a malformed row. Skipping is correct:
-            // the next line back is still a complete record.
-            continue;
-        };
-        if let Some(state) = codex_turn_state(&value)
-            .or_else(|| pi_turn_state(&value))
-            .or_else(|| claude_turn_state(&value))
-        {
-            return state;
-        }
+    let len = fs::metadata(path).ok()?.len();
+    if len == 0 {
+        return None;
     }
-    None
+    let mut window = TAIL_START.min(len);
+    loop {
+        if let Some(text) = read_tail(path, window, len) {
+            // Newest first: the most recent lifecycle record describes the session *now*, so an
+            // earlier `task_complete` must not keep a card green once the next turn has begun.
+            // Anything newer than the record we return is closer to EOF and therefore inside the
+            // same window, so the first hit scanning backwards is the newest overall.
+            for line in text.lines().rev() {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                    // A row cut in half by the window, or a malformed row. Skipping is correct:
+                    // the next line back is still a complete record.
+                    continue;
+                };
+                if let Some(state) = codex_turn_state(&value)
+                    .or_else(|| pi_turn_state(&value))
+                    .or_else(|| claude_turn_state(&value))
+                {
+                    return Some(state);
+                }
+            }
+        }
+        // Nothing in this window. Widen and try again, or give up at the cap / file start.
+        if window >= len || window >= TAIL_MAX {
+            return None;
+        }
+        window = window.saturating_mul(TAIL_GROWTH).min(TAIL_MAX).min(len);
+    }
 }
 
 /// codex: `{"type":"event_msg","payload":{"type":"task_started"|"task_complete"|…}}`.
@@ -65,26 +87,39 @@ pub fn turn_state(path: &Path) -> Option<SessionStatus> {
 /// A terminal marker means the turn is over; `task_started` means it is not. Both are
 /// statements by codex, not guesses -- which is why a `task_started` with nothing after it
 /// reports Working even if the file has not been touched for minutes.
-fn codex_turn_state(value: &serde_json::Value) -> Option<Option<SessionStatus>> {
+///
+/// Returns `None` for every other row, **including a codex `event_msg` that is not one of the
+/// four markers** (`item_completed`, `token_count`, `thread_settings_applied`, ...). Those rows
+/// stream continuously *after* the marker that matters, so treating one as an answer stopped
+/// the scan and made codex fall back to the freshness guess almost every time -- the bug that
+/// hid the whole feature for codex while pi and claude looked fine.
+fn codex_turn_state(value: &serde_json::Value) -> Option<SessionStatus> {
     if value.get("type").and_then(|t| t.as_str()) != Some("event_msg") {
         return None;
     }
-    let kind = value
+    match value
         .get("payload")
         .and_then(|p| p.get("type"))
-        .and_then(|t| t.as_str())?;
-    match kind {
-        "task_started" => Some(Some(SessionStatus::Working)),
-        // Upstream treats all three as terminal turns, including the failures -- a turn that
-        // died is over, and the card must stop looking busy.
-        "task_complete" => Some(Some(SessionStatus::Done)),
-        "turn_aborted" | "turn_failed" => Some(Some(SessionStatus::Error)),
-        _ => Some(None),
+        .and_then(|t| t.as_str())?
+    {
+        "task_started" => Some(SessionStatus::Working),
+        // The turn ended. Upstream folds every terminal marker (complete / aborted / failed)
+        // into "not working", and the same shape has to hold here: a turn that is over must stop
+        // looking busy.
+        "task_complete" => Some(SessionStatus::Done),
+        // A user pressed Esc. That is an ordinary end of turn waiting for the next prompt -- it
+        // is not an error, and painting it red would scold the person who did it. Upstream
+        // treats abort exactly like completion; Done is our nearer equivalent.
+        "turn_aborted" => Some(SessionStatus::Done),
+        // A genuine failure is worth its own word, and it is a fact the transcript states
+        // (`turn_failed`), not a guess.
+        "turn_failed" => Some(SessionStatus::Error),
+        _ => None,
     }
 }
 
 /// pi: `{"type":"message","message":{"role":…,"content":[…]}}`.
-fn pi_turn_state(value: &serde_json::Value) -> Option<Option<SessionStatus>> {
+fn pi_turn_state(value: &serde_json::Value) -> Option<SessionStatus> {
     if value.get("type").and_then(|t| t.as_str()) != Some("message") {
         return None;
     }
@@ -95,22 +130,22 @@ fn pi_turn_state(value: &serde_json::Value) -> Option<Option<SessionStatus>> {
         "assistant" => {
             let content = message.get("content");
             if content_has_block(content, "toolCall") {
-                Some(Some(SessionStatus::Working))
+                Some(SessionStatus::Working)
             } else {
                 // Only text: it finished speaking, so the turn is the human's now.
-                Some(Some(SessionStatus::Done))
+                Some(SessionStatus::Done)
             }
         }
         // The tool answered; the model continues from here.
-        "toolResult" => Some(Some(SessionStatus::Working)),
+        "toolResult" => Some(SessionStatus::Working),
         // A real prompt from the human started a turn.
-        "user" => Some(Some(SessionStatus::Working)),
-        _ => Some(None),
+        "user" => Some(SessionStatus::Working),
+        _ => None,
     }
 }
 
 /// claude: `{"type":"assistant"|"user","message":{"role":…,"content":[…]}}`.
-fn claude_turn_state(value: &serde_json::Value) -> Option<Option<SessionStatus>> {
+fn claude_turn_state(value: &serde_json::Value) -> Option<SessionStatus> {
     let kind = value.get("type").and_then(|t| t.as_str())?;
     if kind != "assistant" && kind != "user" {
         return None;
@@ -120,16 +155,16 @@ fn claude_turn_state(value: &serde_json::Value) -> Option<Option<SessionStatus>>
     if kind == "assistant" {
         // A tool call means it is waiting on the tool; plain text means it stopped talking.
         if content_has_block(content, "tool_use") {
-            return Some(Some(SessionStatus::Working));
+            return Some(SessionStatus::Working);
         }
-        return Some(Some(SessionStatus::Done));
+        return Some(SessionStatus::Done);
     }
     // A `user` row is either a real prompt (a new turn) or the tool's own result arriving --
     // claude records both under the same type, and only the content tells them apart.
     if content_has_block(content, "tool_result") {
-        return Some(Some(SessionStatus::Working));
+        return Some(SessionStatus::Working);
     }
-    Some(Some(SessionStatus::Working))
+    Some(SessionStatus::Working)
 }
 
 /// Does this content hold a block of the given type? Content is a string for some rows and an
@@ -143,15 +178,25 @@ fn content_has_block(content: Option<&serde_json::Value>, kind: &str) -> bool {
     })
 }
 
-/// Read at most `limit` bytes from the end of a file.
-fn read_tail(path: &Path, limit: u64) -> Option<String> {
+/// Read at most `window` bytes from the end of a file. When the window does not reach the start
+/// of the file the buffer begins mid-line, so the leading partial line is dropped -- a record cut
+/// there is simply not seen yet, and the next expansion reads it whole.
+fn read_tail(path: &Path, window: u64, len: u64) -> Option<String> {
     let mut file = fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let take = len.min(limit);
+    let take = window.min(len);
+    if take == 0 {
+        return None;
+    }
     file.seek(SeekFrom::End(-(take as i64))).ok()?;
     let mut buffer = vec![0u8; take as usize];
     file.read_exact(&mut buffer).ok()?;
-    Some(String::from_utf8_lossy(&buffer).into_owned())
+    let mut text = String::from_utf8_lossy(&buffer).into_owned();
+    if take < len {
+        if let Some(newline) = text.find('\n') {
+            text.drain(..=newline);
+        }
+    }
+    Some(text)
 }
 
 #[cfg(test)]
@@ -201,19 +246,21 @@ mod tests {
     }
 
     #[test]
-    fn codex_aborted_and_failed_turns_are_terminal_and_not_working() {
-        // Upstream: an aborted or failed turn is over. It must not keep looking busy.
-        for marker in ["turn_aborted", "turn_failed"] {
+    fn codex_terminal_turns_stop_looking_busy() {
+        // Upstream folds complete / aborted / failed into "not working"; all three must keep the
+        // card from looking busy. An abort is the user's own Esc, not an error, so it reads as a
+        // finished turn; only a real failure gets the Error word.
+        for (marker, expected) in [
+            ("task_complete", SessionStatus::Done),
+            ("turn_aborted", SessionStatus::Done),
+            ("turn_failed", SessionStatus::Error),
+        ] {
             let path = write(&format!("codex-{marker}"), &format!(
                 "{}\n{}\n",
                 r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
                 format!(r#"{{"type":"event_msg","payload":{{"type":"{marker}"}}}}"#)
             ));
-            let state = turn_state(&path);
-            assert!(
-                state == Some(SessionStatus::Error),
-                "{marker} must be terminal, got {state:?}"
-            );
+            assert_eq!(turn_state(&path), Some(expected), "{marker}");
         }
     }
 
@@ -261,6 +308,69 @@ mod tests {
             r#"[{"type":"text","text":"all done"}]}}"#, "\n",
         ));
         assert_eq!(turn_state(&finished), Some(SessionStatus::Done));
+    }
+
+    #[test]
+    fn codex_a_non_marker_event_msg_does_not_end_the_search() {
+        // The bug that hid the feature for codex: the rows after a turn marker are ordinary
+        // event_msgs (`item_completed` / `token_count`), and treating one as an answer stopped
+        // the scan on the newest rows -- so codex fell back to the freshness guess almost every
+        // time while pi and claude (whose rows all carry meaning) looked fine.
+        let path = write("codex-nonmarker", concat!(
+            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#, "\n",
+            r#"{"type":"event_msg","payload":{"type":"item_completed"}}"#, "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count"}}"#, "\n",
+            r#"{"type":"response_item","payload":{"type":"reasoning"}}"#, "\n",
+        ));
+        assert_eq!(turn_state(&path), Some(SessionStatus::Done));
+    }
+
+    #[test]
+    fn a_codex_turn_started_far_from_the_end_is_still_found() {
+        // The bug this guards, found in live data after the small synthetic tests passed: a turn
+        // writes `task_started` and then streams hundreds of KB before it ends, so a fixed 64 KB
+        // tail missed the marker and fell back to a freshness guess -- reporting idle while codex
+        // was working. Measured: 456 KB from the end on one real turn.
+        let mut body = String::new();
+        body.push_str(r#"{"type":"event_msg","payload":{"type":"task_started"}}"#);
+        body.push('\n');
+        let filler = format!(
+            r#"{{"type":"response_item","payload":{{"type":"reasoning","text":"{}"}}}}"#,
+            "x".repeat(900)
+        );
+        for _ in 0..600 {
+            body.push_str(&filler);
+            body.push('\n');
+        }
+        let path = write("codex-far", &body);
+        assert!(
+            fs::metadata(&path).unwrap().len() > 500 * 1024,
+            "filler must push the marker well beyond the first window"
+        );
+        assert_eq!(turn_state(&path), Some(SessionStatus::Working));
+    }
+
+    #[test]
+    fn a_codex_terminal_marker_far_from_the_end_still_wins() {
+        // The mirror case: the turn finished and then a large result was written, so the terminal
+        // marker is far back. It must still be read as Done rather than missed.
+        let filler = format!(
+            r#"{{"type":"response_item","payload":{{"type":"reasoning","text":"{}"}}}}"#,
+            "y".repeat(900)
+        );
+        let mut body = String::new();
+        for _ in 0..600 {
+            body.push_str(&filler);
+            body.push('\n');
+        }
+        body.push_str(r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#);
+        body.push('\n');
+        for _ in 0..600 {
+            body.push_str(&filler);
+            body.push('\n');
+        }
+        let path = write("codex-far-done", &body);
+        assert_eq!(turn_state(&path), Some(SessionStatus::Done));
     }
 
     #[test]
