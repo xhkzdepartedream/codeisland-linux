@@ -1054,6 +1054,13 @@ MouseArea {
                     border.color: blocked
                                   ? island.statusColor(status)
                                   : (status === "done" ? "#63e6be" : "#2c2c2e")
+                    // The mascot only animates while the agent is actually at it.
+                    // done and idle are stillness: a finished or resting agent has
+                    // nothing to animate, and a static row reads quieter -- which is
+                    // exactly the point of dimming the card when it is done.
+                    readonly property bool busy:
+                        status === "working" || status === "waiting_approval"
+                        || status === "waiting_input" || status === "error"
 
                     RowLayout {
                         anchors.fill: parent
@@ -1085,7 +1092,11 @@ MouseArea {
                                 // edges crisp instead of turning the character into a blur.
                                 smooth: false
                                 fillMode: Image.PreserveAspectFit
-                                playing: true
+                                // Motion is reserved for a session that is actually
+                                // working (or waiting on the human); a done/idle row
+                                // holds the first frame, so the animation never plays
+                                // behind a card that has nothing left to do.
+                                playing: busy
                                 // Hidden (not merely transparent) when there is no asset, so
                                 // the fallback dot below takes the slot.
                                 visible: mascotPath.length > 0 && status !== AnimatedImage.Error

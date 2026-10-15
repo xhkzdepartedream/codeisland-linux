@@ -298,6 +298,13 @@ int SessionsModel::urgency(const QString &status)
 
 void SessionsModel::sortRows()
 {
+    // Session order is stable by construction: the key is the session's own
+    // start time, which never changes, so rows do not reshuffle every time an
+    // agent emits an event. Urgency still rules at the top level -- a card that
+    // needs the human must stay visible no matter how old the session is -- but
+    // inside each urgency class the order is fixed by when each session began,
+    // newest first. (The previous key, last activity, made every working card
+    // jump past its neighbours on each tool call.)
     if (m_agentGrouped) {
         // The toolbar's AGENT view: same sessions, grouped by tool. Urgency still
         // rules inside a group -- a waiting session still beats a working one --
@@ -314,7 +321,7 @@ void SessionsModel::sortRows()
             if (ua != ub) {
                 return ua < ub;
             }
-            return a.lastEventMs > b.lastEventMs;
+            return a.startedMs > b.startedMs;
         });
         return;
     }
@@ -324,7 +331,7 @@ void SessionsModel::sortRows()
         if (ua != ub) {
             return ua < ub;
         }
-        return a.lastEventMs > b.lastEventMs;
+        return a.startedMs > b.startedMs;
     });
 }
 
