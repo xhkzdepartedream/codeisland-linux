@@ -115,7 +115,13 @@ private:
     static int urgency(const QString &status);
     // Fixed per-tool order for the AGENT view.
     static int agentRank(const QString &source);
-    void sortRows();
+    // The one ordering rule. True when `a` sits before `b`: urgency first, then
+    // session start time (newest first) -- a key that never changes, so a row's
+    // position only moves when its urgency class does.
+    bool ordersBefore(const SessionRow &a, const SessionRow &b) const;
+    // Where `probe` belongs among m_rows. `selfIndex` is the probe's current
+    // position, or -1 when it is not in the list yet.
+    int insertionPoint(const SessionRow &probe, int selfIndex) const;
 
     QVector<SessionRow> m_rows;
     QHash<QString, int> m_indexById;

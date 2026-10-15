@@ -105,14 +105,30 @@ void SessionsModel::applyUpsert(const QVariantMap &session)
 
     if (existing >= 0) {
         m_rows[existing] = row;
+        // Order is a derived property of the row: urgency first, then start
+        // time. A changed status can move the row between urgency classes, so
+        // re-place it with an explicit move -- the view must be told, or it
+        // keeps showing the old position and the list looks like it shuffles
+        // at random. (Sorting the container after endInsertRows without
+        // announcing it left exactly that bug.)
+        const int target = insertionPoint(row, existing);
+        if (target != existing) {
+            // beginMoveRows' destination is the index *before which* the row
+            // lands; moving down needs dest+1, moving up is already right.
+            const int announced = target > existing ? target + 1 : target;
+            beginMoveRows(QModelIndex(), existing, existing, QModelIndex(), announced);
+            m_rows.move(existing, target);
+            endMoveRows();
+        }
         emit dataChanged(index(existing), index(existing));
     } else {
-        beginInsertRows(QModelIndex(), m_rows.size(), m_rows.size());
-        m_rows.append(row);
+        // Insert straight into its sorted slot so no move is needed later.
+        const int target = insertionPoint(row, -1);
+        beginInsertRows(QModelIndex(), target, target);
+        m_rows.insert(target, row);
         endInsertRows();
     }
 
-    sortRows();
     emit changed();
 }
 
@@ -131,6 +147,8 @@ void SessionsModel::applyRemove(const QString &id)
 
 void SessionsModel::applySnapshot(const QVariantList &sessions)
 {
+    // One reset, one ordering pass, so the view sees the final order in a single
+    // transition instead of the insertion order followed by a silent re-sort.
     beginResetModel();
     m_rows.clear();
     for (const QVariant &variant : sessions) {
@@ -159,8 +177,9 @@ void SessionsModel::applySnapshot(const QVariantList &sessions)
             m_rows.append(row);
         }
     }
+    std::stable_sort(m_rows.begin(), m_rows.end(),
+                     [this](const SessionRow &a, const SessionRow &b) { return ordersBefore(a, b); });
     endResetModel();
-    sortRows();
     emit changed();
 }
 
@@ -296,43 +315,48 @@ int SessionsModel::urgency(const QString &status)
     return 5;
 }
 
-void SessionsModel::sortRows()
+bool SessionsModel::ordersBefore(const SessionRow &a, const SessionRow &b) const
 {
-    // Session order is stable by construction: the key is the session's own
-    // start time, which never changes, so rows do not reshuffle every time an
-    // agent emits an event. Urgency still rules at the top level -- a card that
-    // needs the human must stay visible no matter how old the session is -- but
-    // inside each urgency class the order is fixed by when each session began,
-    // newest first. (The previous key, last activity, made every working card
-    // jump past its neighbours on each tool call.)
+    // Session order is stable by construction: the outer key is urgency (a card
+    // waiting on the human stays visible no matter how old its session is), and
+    // inside each urgency class the key is the session's own start time, newest
+    // first -- immutable, so rows do not reshuffle every time an agent emits an
+    // event. The previous key, last activity, made every working card jump past
+    // its neighbours on each tool call.
     if (m_agentGrouped) {
-        // The toolbar's AGENT view: same sessions, grouped by tool. Urgency still
-        // rules inside a group -- a waiting session still beats a working one --
-        // but the groups themselves sit in a fixed order so the eye can scan one
-        // agent at a time, which is the point of the tab.
-        std::stable_sort(m_rows.begin(), m_rows.end(), [](const SessionRow &a, const SessionRow &b) {
-            const int ga = agentRank(a.source);
-            const int gb = agentRank(b.source);
-            if (ga != gb) {
-                return ga < gb;
-            }
-            const int ua = urgency(a.status);
-            const int ub = urgency(b.status);
-            if (ua != ub) {
-                return ua < ub;
-            }
-            return a.startedMs > b.startedMs;
-        });
-        return;
-    }
-    std::stable_sort(m_rows.begin(), m_rows.end(), [](const SessionRow &a, const SessionRow &b) {
-        const int ua = urgency(a.status);
-        const int ub = urgency(b.status);
-        if (ua != ub) {
-            return ua < ub;
+        // The toolbar's AGENT view: same sessions, grouped by tool. Urgency
+        // still rules inside a group, but the groups sit in a fixed order so the
+        // eye can scan one agent at a time -- the point of the tab.
+        const int ga = agentRank(a.source);
+        const int gb = agentRank(b.source);
+        if (ga != gb) {
+            return ga < gb;
         }
-        return a.startedMs > b.startedMs;
-    });
+    }
+    const int ua = urgency(a.status);
+    const int ub = urgency(b.status);
+    if (ua != ub) {
+        return ua < ub;
+    }
+    return a.startedMs > b.startedMs;
+}
+
+int SessionsModel::insertionPoint(const SessionRow &probe, int selfIndex) const
+{
+    // Count the rows that must sit before `probe`. The list is always ordered
+    // (every mutation re-places its row), so a full pass over a handful of rows
+    // is cheaper than reasoning about early breaks, and it is robust even when
+    // an old ordering bug left the container unsorted.
+    int pos = 0;
+    for (int i = 0; i < m_rows.size(); ++i) {
+        if (i == selfIndex) {
+            continue; // the probe itself occupies this slot
+        }
+        if (ordersBefore(m_rows.at(i), probe)) {
+            ++pos;
+        }
+    }
+    return pos;
 }
 
 int SessionsModel::agentRank(const QString &source)
@@ -358,8 +382,11 @@ void SessionsModel::setAgentGrouped(bool grouped)
     }
     m_agentGrouped = grouped;
     if (!m_rows.isEmpty()) {
+        // Grouping changes the ordering rule, so the rows have to be re-sorted
+        // as one visible transition.
         beginResetModel();
-        sortRows();
+        std::stable_sort(m_rows.begin(), m_rows.end(),
+                         [this](const SessionRow &a, const SessionRow &b) { return ordersBefore(a, b); });
         endResetModel();
     }
     emit agentGroupedChanged();
