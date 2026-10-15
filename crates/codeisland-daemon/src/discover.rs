@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Which harness a discovered session belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -110,7 +110,21 @@ pub struct AgentProcess {
     pub harness: Harness,
     pub pid: u32,
     pub cwd: PathBuf,
+    /// Epoch milliseconds of the process's start, or 0 when it could not be read.
+    ///
+    /// A transcript last written *before* this moment cannot belong to the process:
+    /// the harness's previous session ended with its own process, and a freshly started
+    /// agent that has not written anything yet must not inherit that session's row.
+    /// Upstream carries the same field for the same reason -- its comment reads
+    /// "Process start time filters stale transcript files".
+    pub started_ms: u64,
 }
+
+/// How much slack a transcript's last write gets against the process start, in
+/// milliseconds. Upstream allows 10 seconds (`modified < start.addingTimeInterval(-10)`);
+/// the same tolerance absorbs coarse filesystem timestamps and the one-second
+/// rounding between `/proc` tick arithmetic and wall time.
+const START_GRACE_MS: u64 = 10_000;
 
 
 /// Read at most `limit` bytes from the start, and separately report the file size.
@@ -201,6 +215,7 @@ pub fn agent_processes() -> Vec<AgentProcess> {
     let Ok(entries) = fs::read_dir("/proc") else {
         return out;
     };
+    let boot_epoch_ms = boot_epoch_ms();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(pid) = name.to_string_lossy().parse::<u32>().ok() else {
@@ -223,13 +238,51 @@ pub fn agent_processes() -> Vec<AgentProcess> {
         let Ok(cwd) = fs::read_link(format!("/proc/{pid}/cwd")) else {
             continue;
         };
+        let started_ms = boot_epoch_ms
+            .and_then(|boot| process_start_ms(pid).map(|start| boot.saturating_add(start)));
         out.push(AgentProcess {
             harness,
             pid,
             cwd,
+            started_ms: started_ms.unwrap_or(0),
         });
     }
     out
+}
+
+/// Epoch milliseconds of the last boot, from `/proc/uptime`'s first field.
+fn boot_epoch_ms() -> Option<u64> {
+    let uptime = fs::read_to_string("/proc/uptime").ok()?;
+    let seconds = uptime.split_whitespace().next()?.parse::<f64>().ok()?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some(now_ms.saturating_sub((seconds * 1000.0) as u64))
+}
+
+/// Milliseconds since boot at which the process started, from `/proc/<pid>/stat`'s
+/// `starttime` field. Verified against `ps -o lstart` on this machine: agrees to
+/// within one second.
+fn process_start_ms(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    // After the closing paren: fields[0] is the state, fields[19] is `starttime`
+    // (field 22 of the whole line), in clock ticks since boot.
+    let ticks = fields.get(19)?.parse::<u64>().ok()?;
+    let ticks_per_sec = ticks_per_sec();
+    Some(ticks.saturating_mul(1000) / ticks_per_sec.max(1))
+}
+
+fn ticks_per_sec() -> u64 {
+    // `USER_HZ` is 100 on effectively every Linux; sysconf confirms it when it can.
+    let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if value > 0 {
+        value as u64
+    } else {
+        100
+    }
 }
 
 /// Where each harness keeps its transcripts, honouring the env var the *daemon* was given.
@@ -362,6 +415,32 @@ pub fn discover_in(
         if live == 0 {
             continue;
         }
+        // The earliest start of this harness's live processes, when every one of them is
+        // known. A transcript last written before that moment cannot have been written by
+        // any process still running: it belongs to a session that already ended. The
+        // resurrection this prevents is measured, not hypothetical -- opening a fresh,
+        // empty pi made the island show the session that had ended twelve minutes earlier,
+        // because the freshness pass needed *something* recent to pair the new process with.
+        // One unknown start makes the bound unknowable, so it comes off entirely rather than
+        // risking a wrong exclusion.
+        let starts: Vec<u64> = processes
+            .iter()
+            .filter(|process| process.harness == *harness)
+            .map(|process| process.started_ms)
+            .collect();
+        let earliest_start: Option<u64> = if !starts.is_empty() && starts.iter().all(|&s| s > 0) {
+            starts.iter().min().copied()
+        } else {
+            None
+        };
+        // May weak evidence (a cwd match, or freshness) claim this transcript at all?
+        // Strong evidence -- a held rollout or a writer lock -- is exempt: a lock file is
+        // the harness's own "this thread is live" claim, written and removed by the
+        // harness itself, and it outranks anything we can compute from clocks.
+        let predates_live_processes = |entry: &Entry| {
+            earliest_start
+                .map_or(false, |start| entry.last_write_ms.saturating_add(START_GRACE_MS) < start)
+        };
         // The newest `probe_limit` transcripts. `probe_limit` bounds a directory walk to a few
         // stats; how many rows come out is bounded separately, by evidence (an open descriptor
         // or a seated process) and by the per-harness live-process count. It is deliberately
@@ -454,8 +533,13 @@ pub fn discover_in(
             // directory alone -- measured here, a 4-hour-old thread was bound this way and shown
             // as running. So a cwd match is trusted without regard to age only for the harness's
             // newest transcript (a parked agent whose transcript nothing has superseded -- the
-            // realistic long-quiet case); an older one must be recent to count.
+            // realistic long-quiet case), and only when some live process predates that transcript;
+            // an older one must be recent to count, and none of them may predate every live
+            // process -- that is the previous session, not this one.
             let is_newest = index == 0;
+            if predates_live_processes(entry) {
+                continue;
+            }
             if !is_newest && entry.last_write_ms.saturating_add(max_age_ms) < now_ms {
                 continue;
             }
@@ -480,11 +564,21 @@ pub fn discover_in(
         // and only with a transcript recent enough that no process is needed to believe it: an
         // agent that has just started has not written yet, and without the age bound this would
         // resurrect that harness's previous session instead.
+        //
+        // The start bound is what makes that comment true in practice, not just in intent: the
+        // age window is hours wide, and a session that ended minutes ago is inside it. A
+        // transcript written before every live process started is the previous session's
+        // remains -- the measured case was a fresh empty pi claiming a session that ended twelve
+        // minutes before the process began. Upstream filters identically, at file selection:
+        // "Skip files from old sessions: must be modified after process started".
         for (index, entry) in entries.iter().enumerate() {
             if rows.len() >= live {
                 break;
             }
             if rows.iter().any(|(taken, _)| *taken == index) {
+                continue;
+            }
+            if predates_live_processes(entry) {
                 continue;
             }
             if entry.last_write_ms.saturating_add(max_age_ms) < now_ms {
@@ -906,6 +1000,7 @@ mod tests {
             harness: Harness::Pi,
             pid: 4242,
             cwd: PathBuf::from("/tmp/proj"),
+            started_ms: now_ms() - 60_000,
         }];
         let home = root.clone();
         let mut cache = std::collections::HashMap::new();
@@ -937,6 +1032,7 @@ mod tests {
             harness: Harness::Pi,
             pid: 369446,
             cwd: PathBuf::from("/home/u"),
+            started_ms: now_ms() - 60_000,
         }];
         let home = root.clone();
         let mut cache = std::collections::HashMap::new();
@@ -945,6 +1041,119 @@ mod tests {
         assert_eq!(found[0].transcript, transcript);
         assert_eq!(found[0].cwd, "/home/u/pi-sessions/agent universe");
         assert_eq!(found[0].pid, None, "no process is in that directory, so no pid is claimed");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_transcript_written_before_every_live_process_started_is_not_resurrected() {
+        // The measured bug this bound exists for: opening a fresh, empty pi agent (nothing
+        // sent, so no transcript of its own yet) made the island show the session that had
+        // ended twelve minutes earlier, because the freshness pass needed *something*
+        // recent to pair the new process with. A transcript last written before every live
+        // process started is the previous session's remains. Upstream rejects it at file
+        // selection ("must be modified after process started"); this is the same rule.
+        let root = std::env::temp_dir().join(format!("ci-discover-resurrect-{}", now_ms()));
+        let transcript = fixture(&root, Harness::Pi, "/home/xhkz/apps/old-project", "old-session", "{}");
+        let at = now_ms();
+        filetime(&transcript, at - 12 * 60_000); // the old session ended 12 minutes ago
+        let processes = vec![AgentProcess {
+            harness: Harness::Pi,
+            pid: 1234,
+            cwd: PathBuf::from("/home/xhkz"), // pi chdirs to $HOME at start-up
+            started_ms: at, // the new agent opened *after* the old session ended
+        }];
+        let mut cache = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, at + 60_000, 2 * 60 * 60 * 1000, 50, &mut cache);
+        assert!(
+            found.is_empty(),
+            "an empty new agent must not inherit the previous session: {found:?}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_quiet_session_whose_process_predates_its_last_write_stays() {
+        // The other side of the bound: an agent parked at its prompt wrote its transcript
+        // 90 minutes ago and has been quiet since. Its process predates the write, so the
+        // transcript *can* be its session, and the freshness pass must keep showing it --
+        // tightening past this point would make parked agents vanish.
+        let root = std::env::temp_dir().join(format!("ci-discover-parked-{}", now_ms()));
+        let transcript = fixture(&root, Harness::Pi, "/home/xhkz/apps/proj", "parked-session", "{}");
+        let at = now_ms();
+        filetime(&transcript, at);
+        let processes = vec![AgentProcess {
+            harness: Harness::Pi,
+            pid: 1234,
+            cwd: PathBuf::from("/home/xhkz"),
+            started_ms: at - 60_000, // alive before the last write
+        }];
+        let mut cache = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, at + 90 * 60_000, 2 * 60 * 60 * 1000, 50, &mut cache);
+        assert_eq!(found.len(), 1, "a parked agent is still a session: {found:?}");
+        assert_eq!(found[0].transcript, transcript);
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_transcript_written_while_any_live_process_existed_can_pair() {
+        // Two processes: one old enough to have written the transcript, one brand new.
+        // The bound is the *earliest* start on purpose -- a transcript written while some
+        // live process existed has a possible owner, and a newer process must not veto it.
+        let root = std::env::temp_dir().join(format!("ci-discover-mixed-{}", now_ms()));
+        fixture(&root, Harness::Pi, "/home/xhkz/apps/proj", "shared-harness", "{}");
+        let at = now_ms();
+        let dir = root.join(".pi/agent/sessions/--tmp-proj--");
+        let transcript = dir.join("shared-harness.jsonl");
+        filetime(&transcript, at - 30 * 60_000); // written 30 minutes ago
+        let processes = vec![
+            AgentProcess { harness: Harness::Pi, pid: 1, cwd: PathBuf::from("/home/xhkz"), started_ms: at - 3_600_000 },
+            AgentProcess { harness: Harness::Pi, pid: 2, cwd: PathBuf::from("/home/xhkz"), started_ms: at - 60_000 },
+        ];
+        let mut cache = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, at, 2 * 60 * 60 * 1000, 50, &mut cache);
+        assert_eq!(found.len(), 1, "the older process can still own it: {found:?}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_new_process_in_the_transcripts_directory_does_not_inherit_the_old_session() {
+        // The cwd rule's newest-exemption used to trust a fresh process sitting in the
+        // transcript's directory no matter when the transcript was written. Same
+        // resurrection through a different door: launching a new agent in a directory
+        // whose previous session ended minutes ago must not show that session as running.
+        let root = std::env::temp_dir().join(format!("ci-discover-cwdnew-{}", now_ms()));
+        let transcript = fixture(&root, Harness::Claude, "/tmp/proj", "ended-earlier", "{}");
+        let at = now_ms();
+        filetime(&transcript, at - 12 * 60_000); // ended 12 minutes ago
+        let processes = vec![AgentProcess {
+            harness: Harness::Claude,
+            pid: 1,
+            cwd: PathBuf::from("/tmp/proj"), // sitting right in it
+            started_ms: at, // opened after the session ended
+        }];
+        let mut cache = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, at + 60_000, 2 * 60 * 60 * 1000, 50, &mut cache);
+        assert!(found.is_empty(), "the directory match must not resurrect: {found:?}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_process_with_unknown_start_leaves_the_bound_off() {
+        // When the start time cannot be read (0), the bound must come off entirely rather
+        // than exclude wrongly: an unknown start could be arbitrarily early, so claiming
+        // to know the earliest one would be a guess. Pairing then behaves exactly as it
+        // did before the bound existed.
+        let root = std::env::temp_dir().join(format!("ci-discover-unknown-{}", now_ms()));
+        fixture(&root, Harness::Pi, "/home/xhkz/apps/proj", "fresh-anyway", "{}");
+        let processes = vec![AgentProcess {
+            harness: Harness::Pi,
+            pid: 1234,
+            cwd: PathBuf::from("/home/xhkz"),
+            started_ms: 0, // unknown
+        }];
+        let mut cache = std::collections::HashMap::new();
+        let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
+        assert_eq!(found.len(), 1, "no bound is applied when the start is unknown: {found:?}");
         fs::remove_dir_all(&root).ok();
     }
 
@@ -970,10 +1179,13 @@ mod tests {
 
         // A running process in some *other* directory: it cannot claim this transcript by
         // cwd, so only the freshness pass could pick it up, and the age bound must refuse.
+        // The process predates the transcript's write, so the start bound lets it through
+        // and the test stays about the age bound.
         let processes = vec![AgentProcess {
             harness: Harness::Claude,
             pid: 1,
             cwd: PathBuf::from("/tmp/elsewhere"),
+            started_ms: now_ms() - 3_600_000,
         }];
         let mut cache = std::collections::HashMap::new();
         let found = discover_in(&root, processes, an_hour_later, 60_000, 50, &mut cache);
@@ -992,6 +1204,7 @@ mod tests {
             harness: Harness::Claude,
             pid: 1,
             cwd: PathBuf::from("/tmp/proj"),
+            started_ms: now_ms() - 60_000,
         }];
         let an_hour_later = now_ms() + 3_600_000;
         let mut cache = std::collections::HashMap::new();
@@ -1082,8 +1295,8 @@ mod tests {
         ).unwrap();
 
         let processes = vec![
-            AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj") },
-            AgentProcess { harness: Harness::Codex, pid: 11, cwd: PathBuf::from("/tmp/proj") },
+            AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj"), started_ms: now_ms() - 60_000 },
+            AgentProcess { harness: Harness::Codex, pid: 11, cwd: PathBuf::from("/tmp/proj"), started_ms: now_ms() - 60_000 },
         ];
         let mut cache = std::collections::HashMap::new();
         let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
@@ -1110,7 +1323,7 @@ mod tests {
                 "payload":{"cwd":"/tmp/proj","id":child_id,"parent_thread_id":parent_id}
             })),
         ).unwrap();
-        let processes = vec![AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj") }];
+        let processes = vec![AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj"), started_ms: now_ms() - 60_000 }];
         let mut cache = std::collections::HashMap::new();
         let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
         assert_eq!(found.len(), 1, "an orphan subagent is still a live session: {found:?}");
@@ -1227,7 +1440,7 @@ mod tests {
         filetime(&newer, now_ms());
         filetime(&older, now_ms() - 3_600_000);
 
-        let processes = vec![AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj") }];
+        let processes = vec![AgentProcess { harness: Harness::Codex, pid: 10, cwd: PathBuf::from("/tmp/proj"), started_ms: now_ms() - 60_000 }];
         let mut cache = std::collections::HashMap::new();
         let found = discover_in(&root, processes, now_ms(), 600_000, 50, &mut cache);
         assert_eq!(found.len(), 1, "one thread is one row: {found:?}");
@@ -1286,11 +1499,13 @@ mod tests {
                 harness: Harness::Pi,
                 pid: 1,
                 cwd: PathBuf::from("/tmp/proj"),
+                started_ms: now_ms() - 60_000,
             },
             AgentProcess {
                 harness: Harness::Pi,
                 pid: 2,
                 cwd: PathBuf::from("/tmp/proj"),
+                started_ms: now_ms() - 60_000,
             },
         ];
         let mut cache = std::collections::HashMap::new();
@@ -1309,6 +1524,7 @@ mod tests {
                 harness: Harness::Pi,
                 pid: 7,
                 cwd: PathBuf::from("/tmp/proj"),
+                started_ms: now_ms() - 60_000,
             }],
             now_ms(),
             600_000,

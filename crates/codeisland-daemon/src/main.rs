@@ -104,10 +104,16 @@ fn discover_once() {
     let processes = discover::agent_processes();
     println!("codeisland-daemon: 活着的 agent 进程 {} 个", processes.len());
     for process in &processes {
+        let started = if process.started_ms > 0 {
+            format!("{} 秒前启动", (now.saturating_sub(process.started_ms)) / 1000)
+        } else {
+            "启动时间未知".to_string()
+        };
         println!(
-            "  {}  pid={}  cwd={}",
+            "  {}  pid={}  {}  cwd={}",
             process.harness.as_str(),
             process.pid,
+            started,
             process.cwd.display()
         );
     }
