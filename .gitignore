@@ -22,3 +22,6 @@ __pycache__/
 
 # Agent working scratch (upstream sources, verification scripts, screenshots).
 /.temp/
+
+# internal handoff notes stay local
+docs/交接-*.md

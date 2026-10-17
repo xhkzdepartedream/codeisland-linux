@@ -3,8 +3,8 @@
 # Premise check for phase 2: does Claude Code actually fire a PermissionRequest
 # hook event on this machine?
 #
-# Why this needs asking rather than assuming. The user's global
-# ~/.claude/settings.json sets permissions.defaultMode to "bypassPermissions",
+# Why this needs asking rather than assuming. A machine's global
+# ~/.claude/settings.json may set permissions.defaultMode to a bypassing mode,
 # which auto-approves tool calls -- and a bypassed permission is never requested,
 # so a PermissionRequest hook may never fire at all. In that case the approval
 # card would be dead code for Claude Code, and the island's headline feature would

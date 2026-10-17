@@ -2,6 +2,8 @@
 
 把 AI 编码 agent 的状态放进桌面顶部的悬浮胶囊里：一眼看清每个会话在干什么，直接批准工具调用、回答问题，不用切窗口。
 
+![CodeIsland for Linux](docs/images/island-hero.png)
+
 这是 [wxtsky/CodeIsland](https://github.com/wxtsky/CodeIsland)（macOS，MIT）的 Linux/KDE 复刻。外观对齐原版，行为对齐原版，但桌面层是重写的——原来的界面是 SwiftUI + AppKit，画在 MacBook 的物理刘海里，在 Linux 上没有对应物。
 
 ## 当前进度
@@ -11,10 +13,10 @@
 | 0 | 管道打通：hook → 桥接 → 常驻程序 → 事件日志 | **完成**（真实 claude/haiku 四组用例通过） |
 | 1 | 界面：顶部居中悬浮胶囊 | **完成**（`scripts/visual-check.py` 四项像素级断言通过） |
 | 2 | 批准闭环：在胶囊上批准/拒绝工具调用 | **完成**（2026-10-13） |
-| 3 | 回答问题、跳转终端、桌面通知、hook 自动安装 | 进行中：**hook 自动安装 + 复查完成**（2026-10-13，`codeisland-hookctl`）；**提问卡完成**（2026-10-14，单选问题；契约见 `docs/协议.md`） |
-| 4 | 多 CLI 铺开、SSH 远程、推送渠道 | **codex、pi 已接入**（pi 走扩展适配器 `integrations/pi/codeisland.ts`，三例实测：批准生成文件、驳回不生成且无 `PostToolUse`、岛不在场时由 pi 自己决定）；进行中：**codex 已可安装**（2026-10-14：`codeisland-hookctl --source codex` 写项目级 `.codex/hooks.json`，审批闭环实测通过，信任可一次授予并持久化；codex 另有文件夹信任这道前置门，见 `docs/协议.md`） |
+| 3 | 回答问题、跳转终端、桌面通知、hook 自动安装 | **完成**：hook 自动安装 + 复查（`codeisland-hookctl`）、提问卡（单选 + 多问题，2026-10-15 全库实测 20 个真实多问题事件）、跳过（`withdraw`=沉默交回 CLI）、桌面通知 | 
+| 4 | 多 CLI 铺开、SSH 远程、推送渠道 | **codex、pi 已接入**（pi 走扩展适配器 `integrations/pi/codeisland.ts`，三例实测；codex：`codeisland-hookctl --source codex` 写项目级 `.codex/hooks.json`，审批闭环实测通过，信任可一次授予并持久化）；进行中：SSH 远程、推送渠道 |
 
-阶段 4 的 codex、pi 已接入，但两者都只在 **hook 装好之后**启动的 agent 才说话。所以另加了**发现层**（2026-10-14，`crates/codeisland-daemon/src/discover.rs`）：走 `/proc` 找到活着的 claude/codex/pi 进程，配上它拥有的存档文件，于是 hook 装之前就开着的会话、包括**当前正在说话的这个会话**，都能看见。配对靠三档证据：进程开着的会话文件（最硬，codex 的 writer-lock 与 rollout）→ 进程所在目录 → 存档新鲜度。它只能推断 `working`/`idle`——没有 socket 就证明不了「卡在等人回答」——所以界面把这类行标成 `源 ·推断`。**子代理**（codex 的 Guardian review、pi 的嵌套 run）折进被它服务的父会话，不当并列的第二个会话。行上的副行是该会话**最后一个工具调用**（`exec_command · ssh main '…'`），所以能看出它在干什么。边界见 `docs/协议.md`。
+阶段 4 的 codex、pi 已接入，但两者都只在 **hook 装好之后**启动的 agent 才说话。所以另加了**发现层**（2026-10-14，`crates/codeisland-daemon/src/discover.rs`）：走 `/proc` 找到活着的 claude/codex/pi 进程，配上它拥有的存档文件，于是 hook 装之前就开着的会话、包括**当前正在说话的这个会话**，都能看见。配对靠三档证据：进程开着的会话文件（最硬，codex 的 writer-lock 与 rollout）→ 进程所在目录 → 存档新鲜度；存档最后写入早于所有活进程启动的，弱证据不得认领（对齐上游 "must be modified after process started"）。它只能推断 `working`/`idle`——没有 socket 就证明不了「卡在等人回答」——所以界面把这类行标成 `源 ·推断`。**子代理**（codex 的 Guardian review、pi 的嵌套 run）折进被它服务的父会话，不当并列的第二个会话。行上的主标签是会话自己的**对话标题**（codex 线程名 / claude 标题行 / 首条提问兜底），副行是该会话**最后一个工具调用**，所以能看出它在干什么。边界见 `docs/协议.md`。
 
 阶段 0 没有界面，所以常驻程序**故意不回答**权限请求——它保持沉默，让 agent 回落到自己的权限提示。见下面「安全契约」。
 
@@ -22,11 +24,19 @@
 
 阶段 2 当初留的那个「前提」是权限回复的报文格式必须和上游一致，已逐字节对照上游源码与已安装的 `claude` 二进制确认（见 `docs/协议.md`）。闭环的验收方式两条：`scripts/permission-probe.py` 跑六项行为断言（含「撤回是静默而不是 deny」「过期点击不生效」），以及截图量像素确认卡片与按钮真的画出来（窗口高度现在从内容自己推，不再手算）。
 
+### 界面与交互（2026-10-15）
+
+- **全局热键**：`Ctrl+⇧I` 开合面板、`Ctrl+⇧A/D/S` 批准/拒绝/跳过，走 KDE `org.kde.kglobalaccel`（纯 QtDBus，不链 KF），系统设置里可改绑，卡片按钮显示实际绑定键徽标
+- **始终允许（本会话）**：批准的同时回包 `updatedPermissions` 会话规则，claude 之后不再为这个工具弹卡（格式已按 claude 二进制 zod schema 核实；仅 claude 卡显示，其他源降级为一次性批准）
+- **多问题提问卡**：一次 `AskUserQuestion` 多个问题全部可答（全库实测坐实）；`multiSelect` 载荷零出现，保持拒绝不猜
+- **顶部工具条**：`ALL/STATUS/AGENT` 页签、静音真开关、只读生效配置、关岛；两段式标题（项目名 + `#会话标题`）；右上角耗时角标；底栏各工具活会话数 + **真实 token 用量**（只显示 harness 自己申报的数字）
+- **稳定排序**：需要你的永远最上，其余按会话启动时间固定排序（不随每次工具调用跳位）；吉祥物只在干活中状态动，done/idle 静止
+
 ### 装 hook（阶段 3）
 
 ```bash
 # 项目级（默认，安全）：写 ./.claude/settings.json
-cd 你的项目 && ~/apps/codeisland-linux/target/release/codeisland-hookctl install
+cd 你的项目 && <本仓库路径>/target/release/codeisland-hookctl install
 
 # 复查：hook 还在不在、还指向当前桥接程序吗
 codeisland-hookctl verify            # 有问题退出码 1，并说明是哪一项
@@ -46,7 +56,7 @@ codeisland-hookctl install --scope user
 四条硬约束，都带测试：
 
 - **绝不为通知卡住 agent**：发送在独立线程上完成，钩子线程只往一个容量 4 的队列里塞，塞满就丢（迟到的「需要你」比不发更坏）
-- **卡死的通知进程会被杀掉**（3 秒）：这台机器上出过一次「通知服务缺席」的事故，症状不是报错而是 `notify-send` 挂 25~60 秒（见 vault `facts/本机/修复/QQ闪退缺通知applet`）
+- **卡死的通知进程会被杀掉**（3 秒）：通知服务缺席时 `notify-send` 可能不报错而是挂住数十秒，所以发送永远有硬超时
 - **同一会话 5 秒内只通知一次**，不同会话互不影响
 - 通知**从不改变安全契约**：它只是提醒，agent 等到的仍然是「人给了答案」或者「静默」
 
@@ -183,3 +193,5 @@ AI CLI ──触发 hook──▶ codeisland-bridge ──unix socket──▶ c
 ## 许可证
 
 MIT，与上游一致。
+
+> AI生成
